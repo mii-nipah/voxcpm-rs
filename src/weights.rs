@@ -345,6 +345,17 @@ fn materialize_weight_norm(
         )));
     }
 
+    // Fuse Q/K/V projections. The Rust attention module uses a single
+    // `qkv_proj.weight` linear (fused along the output dim) to save kernel
+    // launches on GPU. Checkpoints store three separate tensors; stitch
+    // them here post-remap/post-weight-norm so all sources (plain Python
+    // safetensors, weight-norm materialized, etc.) land in the same map.
+    //
+    // `nn::Linear` weights in burn are `[out_features, in_features]`, so we
+    // concat along dim 0 (row concat) in the order (q, k, v) to match the
+    // `q_size + 2*kv_size` layout the attention forward expects.
+    fuse_qkv(&mut out)?;
+
     let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = out
         .iter()
         .map(|(k, (dtype, shape, data))| {
@@ -406,6 +417,76 @@ fn encode_float(dtype: Dtype, v: &[f32]) -> Vec<u8> {
         }
         other => panic!("encode_float: unsupported target dtype {other:?}"),
     }
+}
+
+/// Fuse `q_proj`/`k_proj`/`v_proj` weights into a single `qkv_proj.weight`
+/// entry. The attention module stores these as one `Linear` to save kernel
+/// launches at inference; the reference checkpoint stores them separately.
+///
+/// PyTorch `Linear.weight` is `[out_features, in_features]`, so concatenating
+/// along dim 0 (the out-features axis) in row-major storage is just byte
+/// append in (q, k, v) order — matching the `q_size + 2*kv_size` split the
+/// attention forward expects.
+///
+/// The `PyTorchToBurnAdapter` downstream still does its usual `[out,in] ->
+/// [in,out]` transpose, landing the fused tensor correctly in burn's layout.
+fn fuse_qkv(
+    out: &mut HashMap<String, (Dtype, Vec<usize>, Vec<u8>)>,
+) -> Result<()> {
+    // Collect all `...q_proj.weight` keys first so we can mutate `out` inside
+    // the loop without aliasing.
+    let q_keys: Vec<String> = out
+        .keys()
+        .filter(|k| k.ends_with(".q_proj.weight"))
+        .cloned()
+        .collect();
+
+    for q_key in q_keys {
+        let stem = q_key
+            .strip_suffix(".q_proj.weight")
+            .expect("filter guarantees suffix");
+        let k_key = format!("{stem}.k_proj.weight");
+        let v_key = format!("{stem}.v_proj.weight");
+        let qkv_key = format!("{stem}.qkv_proj.weight");
+
+        // Only fuse if all three siblings exist; otherwise this is a linear
+        // that happens to be called `q_proj` in some unrelated module.
+        if !out.contains_key(&k_key) || !out.contains_key(&v_key) {
+            continue;
+        }
+
+        let (q_dt, q_shape, q_data) = out.remove(&q_key).unwrap();
+        let (k_dt, k_shape, k_data) = out.remove(&k_key).unwrap();
+        let (v_dt, v_shape, v_data) = out.remove(&v_key).unwrap();
+
+        if q_dt != k_dt || q_dt != v_dt {
+            return Err(Error::Other(format!(
+                "qkv fusion dtype mismatch at {stem}: q={q_dt:?} k={k_dt:?} v={v_dt:?}"
+            )));
+        }
+        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2 {
+            return Err(Error::Other(format!(
+                "qkv fusion expects 2D weights at {stem}, got {q_shape:?}/{k_shape:?}/{v_shape:?}"
+            )));
+        }
+        // In-features (dim 1) must match across q/k/v.
+        if q_shape[1] != k_shape[1] || q_shape[1] != v_shape[1] {
+            return Err(Error::Other(format!(
+                "qkv fusion in-features mismatch at {stem}: q={} k={} v={}",
+                q_shape[1], k_shape[1], v_shape[1]
+            )));
+        }
+
+        let fused_shape = vec![q_shape[0] + k_shape[0] + v_shape[0], q_shape[1]];
+        let mut fused = Vec::with_capacity(q_data.len() + k_data.len() + v_data.len());
+        fused.extend_from_slice(&q_data);
+        fused.extend_from_slice(&k_data);
+        fused.extend_from_slice(&v_data);
+
+        out.insert(qkv_key, (q_dt, fused_shape, fused));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

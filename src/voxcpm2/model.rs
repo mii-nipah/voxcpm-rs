@@ -209,11 +209,26 @@ impl<B: Backend> VoxCpm2Model<B> {
         let mut prefix_feat_cond = prefix_feat;
         let mut pred_feats: Vec<Tensor<B, 4>> = Vec::new();
 
+        let profile = std::env::var("VOXCPM_PROFILE").is_ok();
+        let mut t_dit_ns: u128 = 0;
+        let mut t_stop_ns: u128 = 0;
+        let mut t_lm_ns: u128 = 0;
+        let mut n_steps: usize = 0;
+
+        // Helper closure: force a GPU→CPU sync by reading a tiny scalar.
+        // Only used under VOXCPM_PROFILE to turn async kernel dispatch into
+        // real per-phase wall-clock measurements.
+        let sync_barrier = |t: Tensor<B, 2>| {
+            let _ = t.slice([0..1, 0..1]).into_data();
+        };
+
         for i in 0..max_len {
             // DiT inputs: concat(lm_to_dit(lm), res_to_dit(res))
             let dit1 = self.lm_to_dit_proj.forward(lm_hidden.clone()); // [B, dit_h]
             let dit2 = self.res_to_dit_proj.forward(residual_hidden.clone()); // [B, dit_h]
             let dit_hidden = Tensor::cat(vec![dit1, dit2], 1); // [B, 2*dit_h]
+
+            let t0 = profile.then(std::time::Instant::now);
 
             // Diffusion sample: [B, D, P]
             let pred = self.feat_decoder.forward(
@@ -234,6 +249,13 @@ impl<B: Backend> VoxCpm2Model<B> {
             pred_feats.push(pred4.clone());
             prefix_feat_cond = pred_feat.clone();
 
+            // Profile barrier: force GPU sync so `t_dit_ns` measures real
+            // DiT wall-clock time and not just CPU-side kernel enqueue.
+            if profile {
+                sync_barrier(pred_feat.clone().narrow(2, 0, 1).squeeze_dim(2));
+            }
+            let t1 = profile.then(std::time::Instant::now);
+
             // Stop check.
             let stop_logits = self
                 .stop_head
@@ -242,11 +264,15 @@ impl<B: Backend> VoxCpm2Model<B> {
             // Backend-agnostic int read: argmax tensor's elem type may be i32 (wgpu)
             // or i64 (ndarray). `into_data()` yields a TensorData; use `iter::<i64>()`
             // which converts whatever the underlying dtype is.
+            //
+            // NOTE: `into_data()` is itself a GPU→CPU sync; for profile we
+            // measure the interval around it as the stop-check cost.
             let stop: i64 = stop_arg
                 .into_data()
                 .iter::<i64>()
                 .next()
                 .unwrap_or(0);
+            let t2 = profile.then(std::time::Instant::now);
             if std::env::var("VOXCPM_DEBUG_STOP").is_ok() {
                 // Dtype-agnostic: convert whatever the backend emits to f32.
                 let d = stop_logits.into_data().convert::<f32>();
@@ -258,6 +284,11 @@ impl<B: Backend> VoxCpm2Model<B> {
                 eprintln!("step {i:4} stop={stop} logits=[{:.3}, {:.3}] lm_abs_max={:.3} lm[:4]={:?}", sl.first().copied().unwrap_or(0.0), sl.get(1).copied().unwrap_or(0.0), lh_abs_max, lh_first);
             }
             if i > min_len && stop == 1 {
+                if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+                    t_dit_ns += t1.duration_since(t0).as_nanos();
+                    t_stop_ns += t2.duration_since(t1).as_nanos();
+                    n_steps += 1;
+                }
                 break;
             }
 
@@ -277,6 +308,27 @@ impl<B: Backend> VoxCpm2Model<B> {
                 .forward(Tensor::cat(vec![lm_hidden.clone(), curr_embed2], 1));
             let pos = res_cache.step();
             residual_hidden = self.residual_lm.forward_step(res_input2, pos, &mut res_cache);
+
+            if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+                // Force sync so `t_lm_ns` captures actual LM step wall time.
+                sync_barrier(residual_hidden.clone());
+                let t3 = std::time::Instant::now();
+                t_dit_ns += t1.duration_since(t0).as_nanos();
+                t_stop_ns += t2.duration_since(t1).as_nanos();
+                t_lm_ns += t3.duration_since(t2).as_nanos();
+                n_steps += 1;
+            }
+        }
+
+        if profile && n_steps > 0 {
+            let ms = |ns: u128| (ns as f64) / 1e6;
+            eprintln!(
+                "[profile] AR steps={} dit={:.1}ms stop_sync={:.1}ms lm_tail={:.1}ms avg_per_step: dit={:.2}ms stop={:.2}ms lm={:.2}ms",
+                n_steps, ms(t_dit_ns), ms(t_stop_ns), ms(t_lm_ns),
+                ms(t_dit_ns) / n_steps as f64,
+                ms(t_stop_ns) / n_steps as f64,
+                ms(t_lm_ns) / n_steps as f64,
+            );
         }
 
         // Stack predictions [B, T, P, D] -> [B, D, T*P] (matches Python's

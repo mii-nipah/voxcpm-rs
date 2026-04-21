@@ -5,21 +5,29 @@ use crate::minicpm4::rope::apply_rotary_pos_emb;
 use burn::nn::{Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::activation::softmax;
-use burn::tensor::{Int, TensorData};
+use burn::tensor::TensorData;
 
 /// `(key_cache, value_cache)` for a single layer, shape `[B, num_kv_heads, S_max, head_dim]`.
 pub type LayerKv<B> = (Tensor<B, 4>, Tensor<B, 4>);
 
 #[derive(Module, Debug)]
 pub struct MiniCpmAttention<B: Backend> {
-    pub q_proj: Linear<B>,
-    pub k_proj: Linear<B>,
-    pub v_proj: Linear<B>,
+    /// Fused Q/K/V projection: `hidden -> (num_heads + 2*num_kv_heads) * head_dim`.
+    ///
+    /// Stored in the checkpoint as three separate `q_proj`/`k_proj`/`v_proj`
+    /// weights; the loader concatenates them along the output dim at load
+    /// time (see `src/weights.rs`). Fusing here saves 2 of every 3 linear
+    /// kernel launches per attention layer — a significant win on WGPU where
+    /// per-op launch overhead dominates at batch=1/seq=1 decode.
+    pub qkv_proj: Linear<B>,
     pub o_proj: Linear<B>,
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub scale: f64,
+    /// Cached split offsets for narrowing the fused qkv output.
+    pub q_size: usize,  // num_heads * head_dim
+    pub kv_size: usize, // num_kv_heads * head_dim
 }
 
 impl<B: Backend> MiniCpmAttention<B> {
@@ -28,16 +36,17 @@ impl<B: Backend> MiniCpmAttention<B> {
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
         let hidden = config.hidden_size;
+        let q_size = num_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
 
-        let q_proj = LinearConfig::new(hidden, num_heads * head_dim).with_bias(false).init(device);
-        let k_proj = LinearConfig::new(hidden, num_kv_heads * head_dim).with_bias(false).init(device);
-        let v_proj = LinearConfig::new(hidden, num_kv_heads * head_dim).with_bias(false).init(device);
-        let o_proj = LinearConfig::new(num_heads * head_dim, hidden).with_bias(false).init(device);
+        let qkv_proj = LinearConfig::new(hidden, q_size + 2 * kv_size).with_bias(false).init(device);
+        let o_proj = LinearConfig::new(q_size, hidden).with_bias(false).init(device);
 
         Self {
-            q_proj, k_proj, v_proj, o_proj,
+            qkv_proj, o_proj,
             num_heads, num_kv_heads, head_dim,
             scale: 1.0 / (head_dim as f64).sqrt(),
+            q_size, kv_size,
         }
     }
 
@@ -51,9 +60,11 @@ impl<B: Backend> MiniCpmAttention<B> {
     ) -> (Tensor<B, 3>, LayerKv<B>) {
         let [bsz, q_len, _] = hidden_states.dims();
 
-        let q = self.q_proj.forward(hidden_states.clone());
-        let k = self.k_proj.forward(hidden_states.clone());
-        let v = self.v_proj.forward(hidden_states);
+        // Fused qkv: one matmul instead of three. Split along the last dim.
+        let qkv = self.qkv_proj.forward(hidden_states);
+        let q = qkv.clone().slice([0..bsz, 0..q_len, 0..self.q_size]);
+        let k = qkv.clone().slice([0..bsz, 0..q_len, self.q_size..self.q_size + self.kv_size]);
+        let v = qkv.slice([0..bsz, 0..q_len, self.q_size + self.kv_size..self.q_size + 2 * self.kv_size]);
 
         let q = q.reshape([bsz, q_len, self.num_heads, self.head_dim]).swap_dims(1, 2);
         let k = k.reshape([bsz, q_len, self.num_kv_heads, self.head_dim]).swap_dims(1, 2);
@@ -87,9 +98,11 @@ impl<B: Backend> MiniCpmAttention<B> {
         let [bsz, _] = hidden_states.dims();
         let device = hidden_states.device();
 
-        let q = self.q_proj.forward(hidden_states.clone());
-        let k = self.k_proj.forward(hidden_states.clone());
-        let v = self.v_proj.forward(hidden_states);
+        // Fused qkv: one matmul, split along the last (hidden) dim.
+        let qkv = self.qkv_proj.forward(hidden_states);
+        let q = qkv.clone().slice([0..bsz, 0..self.q_size]);
+        let k = qkv.clone().slice([0..bsz, self.q_size..self.q_size + self.kv_size]);
+        let v = qkv.slice([0..bsz, self.q_size + self.kv_size..self.q_size + 2 * self.kv_size]);
 
         let q: Tensor<B, 4> = q.reshape([bsz, 1, self.num_heads, self.head_dim]).swap_dims(1, 2);
         let k: Tensor<B, 4> = k.reshape([bsz, 1, self.num_kv_heads, self.head_dim]).swap_dims(1, 2);
