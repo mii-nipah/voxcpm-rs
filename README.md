@@ -132,22 +132,50 @@ Provide a short reference clip (ideally a few seconds of clean speech):
 use voxcpm_rs::Prompt;
 
 let opts = GenerateOptions::builder()
-    .prompt(Prompt::Reference { wav: "speaker.wav".into() })
+    .prompt(Prompt::Reference { audio: "speaker.wav".into() })
     .build();
 
 let wav = model.generate("Now I sound like them.", opts)?;
 ```
 
-Or continue from an existing utterance (the model picks up after `prompt_wav`):
+Or continue from an existing utterance (the model picks up after `audio`):
 
 ```rust
 let opts = GenerateOptions::builder()
     .prompt(Prompt::Continuation {
-        prompt_wav:  "intro.wav".into(),
-        prompt_text: "Once upon a time,".into(),
+        audio: "intro.wav".into(),
+        text:  "Once upon a time,".into(),
     })
     .build();
 ```
+
+#### Audio from memory
+
+Prompt audio doesn't have to live on disk. [`PromptAudio`](src/voxcpm2/wrapper.rs)
+accepts three sources — a path, already-encoded bytes, or raw PCM samples — so
+you can plug the model into an in-memory pipeline (microphone capture, HTTP
+upload, another TTS stage, …):
+
+```rust
+use voxcpm_rs::{Prompt, PromptAudio};
+
+// 1. From a file path (the default — `Into<PromptAudio>` is implemented for
+//    `&str`, `&Path` and `PathBuf`):
+let a = Prompt::Reference { audio: "speaker.wav".into() };
+
+// 2. From encoded bytes in memory (any format Symphonia supports):
+let bytes: Vec<u8> = std::fs::read("speaker.flac")?;
+let b = Prompt::Reference { audio: PromptAudio::Encoded(bytes) };
+
+// 3. From raw mono f32 PCM you already have:
+let c = Prompt::Reference {
+    audio: PromptAudio::Pcm { samples, sample_rate: 24_000 },
+};
+```
+
+Symmetrically, [`audio::load_audio_bytes`](src/audio.rs) /
+[`audio::load_audio_bytes_as`](src/audio.rs) let you decode encoded audio
+buffers without touching the filesystem.
 
 ### Tuning knobs
 
