@@ -81,6 +81,19 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
         merge_apply_result(&mut result, r);
     }
 
+    // burn-store reports `missing` per file (any model param not supplied
+    // by *that* file). When loading both `model.safetensors` and
+    // `audiovae.safetensors`, each file legitimately omits the other half
+    // of the model. Dedupe `missing` against the union of `applied` so
+    // the final report shows only params that were truly never loaded.
+    let applied_set: std::collections::HashSet<&str> =
+        result.applied.iter().map(|s| s.as_str()).collect();
+    result.missing.retain(|(path, _)| !applied_set.contains(path.as_str()));
+    // While we're at it, dedupe the missing list itself (a param may be
+    // reported missing by every file).
+    let mut seen = std::collections::HashSet::new();
+    result.missing.retain(|(path, _)| seen.insert(path.clone()));
+
     Ok(result)
 }
 
