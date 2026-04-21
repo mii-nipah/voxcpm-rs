@@ -10,6 +10,50 @@ use burn::prelude::*;
 use burn::tensor::{Int, TensorData};
 use std::path::{Path, PathBuf};
 
+/// Source of prompt audio for [`Prompt::Reference`], [`Prompt::Continuation`]
+/// and [`Prompt::Combined`].
+///
+/// Supports three input modes — pick whichever fits your pipeline:
+/// - [`PromptAudio::File`] — path to an encoded audio file (WAV/FLAC/MP3/...).
+/// - [`PromptAudio::Encoded`] — encoded audio bytes already in memory
+///   (same format support as `File`, just sourced from a `Vec<u8>`).
+/// - [`PromptAudio::Pcm`] — raw mono `f32` samples and their sample rate.
+///   Use this when you already have decoded audio (e.g. from a microphone
+///   capture, an in-process resampler, or a TTS chain).
+///
+/// `From<PathBuf>` / `From<&Path>` / `From<&str>` are implemented for
+/// ergonomics, so paths can be passed directly without wrapping.
+#[derive(Debug, Clone)]
+pub enum PromptAudio {
+    /// Decode an audio file from disk.
+    File(PathBuf),
+    /// Decode an encoded audio buffer (any format Symphonia supports).
+    Encoded(Vec<u8>),
+    /// Use already-decoded mono `f32` samples at the given sample rate.
+    Pcm {
+        /// Mono PCM samples in `[-1.0, 1.0]`.
+        samples: Vec<f32>,
+        /// Sample rate of `samples` in Hz.
+        sample_rate: u32,
+    },
+}
+
+impl From<PathBuf> for PromptAudio {
+    fn from(p: PathBuf) -> Self {
+        PromptAudio::File(p)
+    }
+}
+impl From<&Path> for PromptAudio {
+    fn from(p: &Path) -> Self {
+        PromptAudio::File(p.to_path_buf())
+    }
+}
+impl From<&str> for PromptAudio {
+    fn from(p: &str) -> Self {
+        PromptAudio::File(PathBuf::from(p))
+    }
+}
+
 /// How the model should be conditioned on prompt audio.
 ///
 /// See [`VoxCPM::generate`] for what each mode does conceptually.
@@ -19,27 +63,27 @@ pub enum Prompt {
     #[default]
     None,
     /// Voice cloning via a structurally isolated reference audio prefix.
-    /// No transcript required; the wav is bracketed by `[REF_AUDIO_*]` tokens.
+    /// No transcript required; the audio is bracketed by `[REF_AUDIO_*]` tokens.
     Reference {
-        /// Path to a wav file with the speaker to clone.
-        wav: PathBuf,
+        /// Audio of the speaker to clone. See [`PromptAudio`].
+        audio: PromptAudio,
     },
     /// In-context continuation: the model literally finishes an utterance
-    /// whose start is `wav` (transcribed by `text`).
+    /// whose start is `audio` (transcribed by `text`).
     Continuation {
-        /// Path to a wav file containing the start of the utterance.
-        wav: PathBuf,
-        /// Transcript of `wav` — prepended to the target text before tokenization.
+        /// Audio containing the start of the utterance. See [`PromptAudio`].
+        audio: PromptAudio,
+        /// Transcript of `audio` — prepended to the target text before tokenization.
         text: String,
     },
     /// Reference prefix *and* continuation suffix in the same sequence.
     /// Useful when continuation alone drifts off the speaker.
     Combined {
-        /// Reference wav (prefix, isolated by `[REF_AUDIO_*]` tokens).
-        reference_wav: PathBuf,
-        /// Continuation wav (suffix, autoregression starts from its end).
-        prompt_wav: PathBuf,
-        /// Transcript of `prompt_wav`.
+        /// Reference audio (prefix, isolated by `[REF_AUDIO_*]` tokens).
+        reference_audio: PromptAudio,
+        /// Continuation audio (suffix, autoregression starts from its end).
+        prompt_audio: PromptAudio,
+        /// Transcript of `prompt_audio`.
         prompt_text: String,
     },
 }
@@ -218,22 +262,27 @@ impl<B: Backend> VoxCPM<B> {
     /// - `Right`: pad zeros at the end (used for reference audio in voice cloning).
     /// - `Left`: pad zeros at the start so the *valid* audio sits at the end of
     ///   the sequence (used for continuation prompts).
-    fn encode_prompt_wav(
+    fn encode_prompt_audio(
         &self,
-        wav_path: &Path,
+        audio: &PromptAudio,
         padding_mode: PadMode,
     ) -> crate::Result<Tensor<B, 3>> {
         let encoder_sr = self.model.audio_vae.sample_rate() as u32;
-        let mut samples = crate::audio::load_audio_as(wav_path, encoder_sr)?;
+        let mut samples = match audio {
+            PromptAudio::File(path) => crate::audio::load_audio_as(path, encoder_sr)?,
+            PromptAudio::Encoded(bytes) => crate::audio::load_audio_bytes_as(bytes, encoder_sr)?,
+            PromptAudio::Pcm { samples, sample_rate } => {
+                crate::audio::resample(samples, *sample_rate, encoder_sr)?
+            }
+        };
         let p = self.model.patch_size();
         let chunk = self.model.audio_vae.config.0.chunk_size();
         let patch_len = p * chunk;
         let n = samples.len();
         if n == 0 {
-            return Err(crate::Error::AudioDecode(format!(
-                "prompt audio decoded to 0 samples: {}",
-                wav_path.display()
-            )));
+            return Err(crate::Error::AudioDecode(
+                "prompt audio decoded to 0 samples".into(),
+            ));
         }
         let rem = n % patch_len;
         if rem != 0 {
@@ -274,17 +323,17 @@ impl<B: Backend> VoxCPM<B> {
     pub fn generate(&self, text: &str, opts: GenerateOptions) -> crate::Result<Vec<f32>> {
         // Decompose the prompt into the (optional) reference + continuation
         // pieces the sequence builder consumes.
-        let (ref_wav, prompt_wav, prompt_text) = match &opts.prompt {
+        let (ref_audio, prompt_audio, prompt_text) = match &opts.prompt {
             Prompt::None => (None, None, None),
-            Prompt::Reference { wav } => (Some(wav.as_path()), None, None),
-            Prompt::Continuation { wav, text } => (None, Some(wav.as_path()), Some(text.as_str())),
+            Prompt::Reference { audio } => (Some(audio), None, None),
+            Prompt::Continuation { audio, text } => (None, Some(audio), Some(text.as_str())),
             Prompt::Combined {
-                reference_wav,
-                prompt_wav,
+                reference_audio,
+                prompt_audio,
                 prompt_text,
             } => (
-                Some(reference_wav.as_path()),
-                Some(prompt_wav.as_path()),
+                Some(reference_audio),
+                Some(prompt_audio),
                 Some(prompt_text.as_str()),
             ),
         };
@@ -303,12 +352,12 @@ impl<B: Backend> VoxCPM<B> {
         let text_len = text_tokens.len();
 
         // 2) Encode optional prompt audios.
-        let ref_feat_opt = match ref_wav {
-            Some(path) => Some(self.encode_prompt_wav(path, PadMode::Right)?),
+        let ref_feat_opt = match ref_audio {
+            Some(audio) => Some(self.encode_prompt_audio(audio, PadMode::Right)?),
             None => None,
         };
-        let prompt_feat_opt = match prompt_wav {
-            Some(path) => Some(self.encode_prompt_wav(path, PadMode::Left)?),
+        let prompt_feat_opt = match prompt_audio {
+            Some(audio) => Some(self.encode_prompt_audio(audio, PadMode::Left)?),
             None => None,
         };
 

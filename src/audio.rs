@@ -173,3 +173,56 @@ pub fn load_audio_as(path: impl AsRef<Path>, target_sr: u32) -> Result<Vec<f32>>
     let (pcm, sr) = load_audio(path)?;
     resample(&pcm, sr, target_sr)
 }
+
+/// Decode an encoded audio byte buffer (WAV/FLAC/MP3/etc.) to mono `f32` PCM,
+/// returning `(samples, sample_rate)`. Same format support as
+/// [`load_audio`], just sourced from memory instead of a file.
+pub fn load_audio_bytes(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    let cursor = std::io::Cursor::new(bytes.to_vec());
+    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+    let probed = symphonia::default::get_probe()
+        .format(&Hint::new(), mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| Error::AudioDecode(e.to_string()))?;
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| Error::AudioDecode("no default track".into()))?;
+    let codec_params = track.codec_params.clone();
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|e| Error::AudioDecode(e.to_string()))?;
+    let sr = codec_params
+        .sample_rate
+        .ok_or_else(|| Error::AudioDecode("unknown sample rate".into()))?;
+
+    let mut pcm: Vec<f32> = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            Err(e) => return Err(Error::AudioDecode(e.to_string())),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(e) => return Err(Error::AudioDecode(e.to_string())),
+        };
+        append_mono_f32(&decoded, &mut pcm);
+    }
+    Ok((pcm, sr))
+}
+
+/// Decode an encoded audio byte buffer, downmix to mono, and resample to `target_sr`.
+pub fn load_audio_bytes_as(bytes: &[u8], target_sr: u32) -> Result<Vec<f32>> {
+    let (pcm, sr) = load_audio_bytes(bytes)?;
+    resample(&pcm, sr, target_sr)
+}

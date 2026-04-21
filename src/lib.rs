@@ -8,7 +8,7 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "cpu")] {
-//! use voxcpm_rs::{GenerateOptions, Prompt, VoxCPM};
+//! use voxcpm_rs::{GenerateOptions, Prompt, PromptAudio, VoxCPM};
 //!
 //! type B = burn::backend::NdArray<f32>;
 //! let device = Default::default();
@@ -20,7 +20,7 @@
 //! // Voice cloning from a reference wav:
 //! let opts = GenerateOptions::builder()
 //!     .timesteps(10)
-//!     .prompt(Prompt::Reference { wav: "speaker.wav".into() })
+//!     .prompt(Prompt::Reference { audio: "speaker.wav".into() })
 //!     .build();
 //! let wav = model.generate("Hello, world!", opts).unwrap();
 //!
@@ -54,4 +54,4 @@ pub use config::{
     VoxCpmDitConfig, VoxCpmEncoderConfig,
 };
 pub use error::{Error, Result};
-pub use voxcpm2::{GenerateOptions, GenerateOptionsBuilder, Prompt, VoxCPM};
+pub use voxcpm2::{GenerateOptions, GenerateOptionsBuilder, Prompt, PromptAudio, VoxCPM};

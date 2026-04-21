@@ -53,15 +53,15 @@ fn main() {
 
     let prompt = match mode.as_str() {
         "reference" => Prompt::Reference {
-            wav: PathBuf::from(&wav),
+            audio: PathBuf::from(&wav).into(),
         },
         "continuation" => Prompt::Continuation {
-            wav: PathBuf::from(&wav),
+            audio: PathBuf::from(&wav).into(),
             text: prompt_text.expect("MODE=continuation requires PROMPT_TEXT env var"),
         },
         "combined" => Prompt::Combined {
-            reference_wav: PathBuf::from(&wav),
-            prompt_wav: PathBuf::from(&wav),
+            reference_audio: PathBuf::from(&wav).into(),
+            prompt_audio: PathBuf::from(&wav).into(),
             prompt_text: prompt_text.expect("MODE=combined requires PROMPT_TEXT env var"),
         },
         other => panic!("unknown MODE={other:?} (expected reference|continuation|combined)"),
