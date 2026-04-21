@@ -248,9 +248,10 @@ impl<B: Backend> VoxCpm2Model<B> {
                 .next()
                 .unwrap_or(0);
             if std::env::var("VOXCPM_DEBUG_STOP").is_ok() {
-                let d = stop_logits.into_data();
+                // Dtype-agnostic: convert whatever the backend emits to f32.
+                let d = stop_logits.into_data().convert::<f32>();
                 let sl = d.as_slice::<f32>().unwrap_or(&[]);
-                let lh = lm_hidden.clone().into_data();
+                let lh = lm_hidden.clone().into_data().convert::<f32>();
                 let lhs = lh.as_slice::<f32>().unwrap_or(&[]);
                 let lh_abs_max = lhs.iter().fold(0f32, |a, &b| a.max(b.abs()));
                 let lh_first: Vec<f32> = lhs.iter().take(4).copied().collect();

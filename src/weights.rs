@@ -13,6 +13,7 @@
 //!      effective `weight = weight_g * weight_v / ||weight_v||_per_out_channel`
 //!      tensor on the fly before handing it to burn-store.
 
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -21,11 +22,26 @@ use burn::tensor::TensorData;
 use burn_store::{
     ApplyResult, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore, SafetensorsStoreError,
 };
-use half::bf16;
+use half::{bf16, f16};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
 use crate::{Error, Result};
+
+/// Pick a safetensors dtype to *write* such that burn-store can hand the
+/// bytes to the target backend tensors with no mismatch. burn-store does
+/// not auto-cast across dtypes, so we must materialise weights in the
+/// backend's native float type.
+fn target_float_dtype<B: Backend>() -> Dtype {
+    let id = TypeId::of::<B::FloatElem>();
+    if id == TypeId::of::<f16>() {
+        Dtype::F16
+    } else if id == TypeId::of::<bf16>() {
+        Dtype::BF16
+    } else {
+        Dtype::F32
+    }
+}
 
 /// Load pretrained weights for a [`crate::VoxCpm2Model`] from a snapshot
 /// directory containing `model.safetensors` and (optionally)
@@ -37,6 +53,7 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     let dir = snapshot_dir.as_ref();
     let model_path = dir.join("model.safetensors");
     let vae_path = dir.join("audiovae.safetensors");
+    let target_dtype = target_float_dtype::<B>();
 
     let mut result = ApplyResult {
         applied: Vec::new(),
@@ -47,14 +64,20 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     };
 
     if model_path.exists() {
-        let r = load_single(model, &model_path, None, None)?;
+        let r = load_single(model, &model_path, None, None, target_dtype)?;
         merge_apply_result(&mut result, r);
     } else {
         return Err(Error::NotFound(format!("{}", model_path.display())));
     }
 
     if vae_path.exists() {
-        let r = load_single(model, &vae_path, Some("audio_vae."), Some(remap_audiovae_key))?;
+        let r = load_single(
+            model,
+            &vae_path,
+            Some("audio_vae."),
+            Some(remap_audiovae_key),
+            target_dtype,
+        )?;
         merge_apply_result(&mut result, r);
     }
 
@@ -202,12 +225,13 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     path: &Path,
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
+    target_float_dtype: Dtype,
 ) -> Result<ApplyResult> {
     // Read, materialize weight_norm, re-serialize, then hand to burn-store.
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let st = SafeTensors::deserialize(&mmap)?;
-    let synth_bytes = materialize_weight_norm(&st, prefix, remap)?;
+    let synth_bytes = materialize_weight_norm(&st, prefix, remap, target_float_dtype)?;
     drop(st);
     drop(mmap);
 
@@ -231,6 +255,7 @@ fn materialize_weight_norm(
     st: &SafeTensors<'_>,
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
+    target_float_dtype: Dtype,
 ) -> Result<Vec<u8>> {
     use safetensors::serialize;
 
@@ -269,12 +294,14 @@ fn materialize_weight_norm(
     let mut out: HashMap<String, (Dtype, Vec<usize>, Vec<u8>)> = HashMap::new();
     for (name, shape, dtype, data) in plain {
         let Some(key) = translate(&name) else { continue };
-        // Upcast BF16/F16 → F32 since several burn backends (ndarray) don't
-        // support reduced-precision tensor data.
+        // Normalise to f32 first (uniform handling), then re-encode in the
+        // backend's target float dtype. burn-store does NOT auto-cast across
+        // dtypes: source bytes are handed straight to the target tensor, so
+        // any mismatch leaves params zero-init and the model emits silence.
         let (dtype, data) = match dtype {
-            Dtype::BF16 | Dtype::F16 => {
+            Dtype::F32 | Dtype::F16 | Dtype::BF16 => {
                 let v = decode_f32(dtype, &data)?;
-                (Dtype::F32, f32_to_le_bytes(&v))
+                (target_float_dtype, encode_float(target_float_dtype, &v))
             }
             other => (other, data),
         };
@@ -305,10 +332,10 @@ fn materialize_weight_norm(
                 w[off + j] = slice[j] * scale;
             }
         }
-        let bytes = f32_to_le_bytes(&w);
+        let bytes = encode_float(target_float_dtype, &w);
         let bare = format!("{stem}.weight");
         let Some(key) = translate(&bare) else { continue };
-        out.insert(key, (Dtype::F32, v_shape, bytes));
+        out.insert(key, (target_float_dtype, v_shape, bytes));
     }
 
     if !weight_g.is_empty() {
@@ -357,6 +384,28 @@ fn f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&x.to_le_bytes());
     }
     out
+}
+
+/// Encode a slice of f32 values into the byte layout for a given safetensors\n/// float dtype. Used to materialise weights in the backend's native dtype\n/// because burn-store does not auto-cast across dtypes on load.
+fn encode_float(dtype: Dtype, v: &[f32]) -> Vec<u8> {
+    match dtype {
+        Dtype::F32 => f32_to_le_bytes(v),
+        Dtype::F16 => {
+            let mut out = Vec::with_capacity(v.len() * 2);
+            for x in v {
+                out.extend_from_slice(&f16::from_f32(*x).to_le_bytes());
+            }
+            out
+        }
+        Dtype::BF16 => {
+            let mut out = Vec::with_capacity(v.len() * 2);
+            for x in v {
+                out.extend_from_slice(&bf16::from_f32(*x).to_le_bytes());
+            }
+            out
+        }
+        other => panic!("encode_float: unsupported target dtype {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
