@@ -117,6 +117,12 @@ impl<B: Backend> VoxCPM<B> {
         self.model.sample_rate() as u32
     }
 
+    /// Decode a pre-computed latent `[1, D, T]` through the AudioVAE and
+    /// return the waveform tensor `[1, 1, T_out]`.
+    pub fn audio_vae_decode(&self, feat: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.model.audio_vae.decode(feat)
+    }
+
     /// Generate an audio waveform (mono `f32` samples at [`Self::sample_rate`]).
     ///
     /// Currently zero-shot only: `opts.prompt_wav` / `opts.reference_wav` are

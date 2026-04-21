@@ -45,12 +45,16 @@ impl<B: Backend> UnifiedCfm<B> {
         let [b, _] = mu.dims();
         let device = mu.device();
 
-        let z = Tensor::<B, 3>::random(
-            [b, self.in_channels, patch_size],
-            burn::tensor::Distribution::Normal(0.0, 1.0),
-            &device,
-        )
-        .mul_scalar(temperature);
+        let z = if std::env::var("VOXCPM_Z_ZERO").is_ok() {
+            Tensor::<B, 3>::zeros([b, self.in_channels, patch_size], &device)
+        } else {
+            Tensor::<B, 3>::random(
+                [b, self.in_channels, patch_size],
+                burn::tensor::Distribution::Normal(0.0, 1.0),
+                &device,
+            )
+            .mul_scalar(temperature)
+        };
 
         let n = n_timesteps + 1;
         let step = 1.0 / n_timesteps as f64;
@@ -82,7 +86,6 @@ impl<B: Backend> UnifiedCfm<B> {
 
         let [b, c, time_len] = x.dims();
         let mu_dim = mu.dims()[1];
-        let cond_time = cond.dims()[2];
 
         for step in 1..t_span.len() {
             let dphi_dt: Tensor<B, 3> = if use_cfg_zero_star && step <= zero_init_steps {
@@ -100,8 +103,10 @@ impl<B: Backend> UnifiedCfm<B> {
                 } else {
                     Tensor::<B, 1>::zeros([2 * b], &device)
                 };
-                let cond_zeros = Tensor::<B, 3>::zeros([b, c, cond_time], &device);
-                let cond_in = Tensor::cat(vec![cond.clone(), cond_zeros], 0);
+                // NOTE: only `mu` is zeroed for the unconditional branch; the
+                // prefix-feat `cond` is duplicated as-is. (Matches Python's
+                // `cond_in[:b], cond_in[b:] = cond, cond`.)
+                let cond_in = Tensor::cat(vec![cond.clone(), cond.clone()], 0);
 
                 let out = self.estimator.forward(x_in, mu_in, t_tensor, cond_in, dt_tensor);
                 let pos = out.clone().narrow(0, 0, b);

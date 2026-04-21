@@ -262,12 +262,15 @@ impl<B: Backend> VoxCpm2Model<B> {
             residual_hidden = self.residual_lm.forward_step(res_input2, pos, &mut res_cache);
         }
 
-        // Stack predictions [B, T, P, D] -> [B, D, T*P].
+        // Stack predictions [B, T, P, D] -> [B, D, T*P] (matches Python's
+        // einops `rearrange(..., "b t p d -> b d (t p)")`, where the flat
+        // index `k = t * P + p`).
         let feats = Tensor::cat(pred_feats, 1);
         let [b, t, p2, d2] = feats.dims();
         debug_assert_eq!(p2, p);
         debug_assert_eq!(d2, d);
-        feats.swap_dims(1, 2).swap_dims(2, 3).reshape([b, d, t * p])
+        // Permute [B,T,P,D] -> [B,D,T,P] via swap(1,3) then swap(2,3).
+        feats.swap_dims(1, 3).swap_dims(2, 3).reshape([b, d, t * p])
     }
 }
 
