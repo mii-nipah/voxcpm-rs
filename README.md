@@ -252,5 +252,6 @@ Keep PRs focused — one feature or fix per PR makes review much easier.
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). The vendored reference
-implementation under `vendor/VoxCPM/` retains its own license (see
-[`vendor/VoxCPM/LICENSE`](vendor/VoxCPM/LICENSE)).
+implementation under `vendor/VoxCPM/` (kept in the repository for parity testing,
+not shipped on crates.io) retains its own license — see the
+[upstream LICENSE](https://github.com/OpenBMB/VoxCPM/blob/main/LICENSE).

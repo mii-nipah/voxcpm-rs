@@ -2,8 +2,23 @@
 name = "voxcpm-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Pure-Rust inference for VoxCPM2 on top of the Burn framework (Vulkan + CPU)."
 license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/mii-nipah/voxcpm-rs"
+homepage = "https://github.com/mii-nipah/voxcpm-rs"
+documentation = "https://docs.rs/voxcpm-rs"
+authors = ["nipah~✰! <mii_nipah@pm.me>"]
+keywords = ["tts", "voxcpm", "speech", "audio", "inference"]
+categories = ["multimedia::audio", "science"]
+exclude = [
+    "vendor/",
+    "examples_tmp/",
+    "target/",
+    "/.git/",
+    "*.wav",
+]
 
 [features]
 default = ["cpu"]
