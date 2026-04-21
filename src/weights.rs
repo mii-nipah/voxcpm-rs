@@ -240,19 +240,33 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
 ) -> Result<ApplyResult> {
+    use std::time::Instant;
     // Read, materialize weight_norm, re-serialize, then hand to burn-store.
+    let t0 = Instant::now();
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let st = SafeTensors::deserialize(&mmap)?;
+    log::debug!("weights[{}] mmap+parse: {:.2?}", path.display(), t0.elapsed());
+    let t1 = Instant::now();
     let synth_bytes = materialize_weight_norm(&st, prefix, remap, target_float_dtype)?;
+    log::debug!(
+        "weights[{}] materialize+repack: {:.2?} ({} MB)",
+        path.display(),
+        t1.elapsed(),
+        synth_bytes.len() / (1024 * 1024)
+    );
     drop(st);
     drop(mmap);
+
+    let t2 = Instant::now();
 
     let mut store = SafetensorsStore::from_bytes(Some(synth_bytes))
         .with_from_adapter(PyTorchToBurnAdapter)
         .allow_partial(true);
 
-    model.load_from(&mut store).map_err(map_store_err)
+    let r = model.load_from(&mut store).map_err(map_store_err);
+    log::debug!("weights[{}] burn-store apply: {:.2?}", path.display(), t2.elapsed());
+    r
 }
 
 fn map_store_err(e: SafetensorsStoreError) -> Error {
@@ -307,14 +321,18 @@ fn materialize_weight_norm(
     let mut out: HashMap<String, (Dtype, Vec<usize>, Vec<u8>)> = HashMap::new();
     for (name, shape, dtype, data) in plain {
         let Some(key) = translate(&name) else { continue };
-        // Normalise to f32 first (uniform handling), then re-encode in the
-        // backend's target float dtype. burn-store does NOT auto-cast across
-        // dtypes: source bytes are handed straight to the target tensor, so
-        // any mismatch leaves params zero-init and the model emits silence.
+        // Convert source float dtype directly to target float dtype. burn-store
+        // does NOT auto-cast across dtypes (source bytes are handed straight to
+        // the target tensor), so we must match the backend dtype here. Direct
+        // single-pass conversion writes straight into the output Vec<u8>,
+        // skipping the intermediate Vec<f32> that decode_f32+encode_float
+        // would allocate (matters a lot for multi-GB models).
         let (dtype, data) = match dtype {
+            Dtype::F32 | Dtype::F16 | Dtype::BF16 if dtype == target_float_dtype => {
+                (dtype, data) // already correct dtype, pass through
+            }
             Dtype::F32 | Dtype::F16 | Dtype::BF16 => {
-                let v = decode_f32(dtype, &data)?;
-                (target_float_dtype, encode_float(target_float_dtype, &v))
+                (target_float_dtype, convert_float_bytes(dtype, target_float_dtype, &data))
             }
             other => (other, data),
         };
@@ -407,6 +425,56 @@ fn f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for x in v {
         out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// Single-pass float dtype conversion that writes directly into a fresh
+/// `Vec<u8>` of the target size. Avoids the intermediate `Vec<f32>` that
+/// `decode_f32` + `encode_float` would allocate (~2× peak memory of the
+/// destination, multi-GB for the main model).
+fn convert_float_bytes(src: Dtype, dst: Dtype, data: &[u8]) -> Vec<u8> {
+    let n_elems = match src {
+        Dtype::F32 => data.len() / 4,
+        Dtype::F16 | Dtype::BF16 => data.len() / 2,
+        _ => unreachable!("convert_float_bytes called with non-float src dtype"),
+    };
+    let elem_size = match dst {
+        Dtype::F32 => 4,
+        Dtype::F16 | Dtype::BF16 => 2,
+        _ => unreachable!("convert_float_bytes called with non-float dst dtype"),
+    };
+    let mut out = vec![0u8; n_elems * elem_size];
+
+    macro_rules! pump {
+        ($read:expr, $write:expr, $src_step:expr, $dst_step:expr) => {{
+            let mut s = 0usize;
+            let mut d = 0usize;
+            while s < data.len() {
+                let v: f32 = $read(&data[s..s + $src_step]);
+                let bytes = $write(v);
+                out[d..d + $dst_step].copy_from_slice(&bytes);
+                s += $src_step;
+                d += $dst_step;
+            }
+        }};
+    }
+
+    let read_f32 = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let read_f16 = |b: &[u8]| f16::from_le_bytes([b[0], b[1]]).to_f32();
+    let read_bf16 = |b: &[u8]| bf16::from_le_bytes([b[0], b[1]]).to_f32();
+    let write_f32 = |v: f32| v.to_le_bytes();
+    let write_f16 = |v: f32| f16::from_f32(v).to_le_bytes();
+    let write_bf16 = |v: f32| bf16::from_f32(v).to_le_bytes();
+
+    match (src, dst) {
+        (Dtype::F32, Dtype::F16) => pump!(read_f32, write_f16, 4, 2),
+        (Dtype::F32, Dtype::BF16) => pump!(read_f32, write_bf16, 4, 2),
+        (Dtype::F16, Dtype::F32) => pump!(read_f16, write_f32, 2, 4),
+        (Dtype::F16, Dtype::BF16) => pump!(read_f16, write_bf16, 2, 2),
+        (Dtype::BF16, Dtype::F32) => pump!(read_bf16, write_f32, 2, 4),
+        (Dtype::BF16, Dtype::F16) => pump!(read_bf16, write_f16, 2, 2),
+        _ => unreachable!("same-dtype conversion should have been short-circuited"),
     }
     out
 }
