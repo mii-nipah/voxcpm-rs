@@ -7,8 +7,17 @@ license = "Apache-2.0"
 
 [features]
 default = ["cpu"]
-# Vulkan / WGPU backend (primary target: AMD + NVIDIA via wgpu)
+# Vulkan / WGPU backend (primary target: AMD + NVIDIA via wgpu).
+# Minimal build: fast cold start, ~5-7% slower steady-state.
 wgpu = ["burn/wgpu"]
+# Opt-in perf: enables burn-cubecl-fusion (auto-fuses elementwise chains
+# into single GPU kernels) and cubecl autotune (picks the best matmul
+# kernel per shape). Gains ~5-7% steady-state RTF but pays a cold-start
+# cost on the first 1-2 runs while cubecl measures kernels. Results are
+# cached in `target/autotune/` and persist across runs.
+# Tip: set `CUBECL_AUTOTUNE_LEVEL=minimal` at runtime to shrink the
+# cold-start cost (uses a cheap heuristic instead of measuring).
+wgpu-fast = ["wgpu", "burn/fusion", "burn/autotune"]
 # Pure-CPU fallback using ndarray. SIMD speeds up elementwise ops; ndarray's
 # native matmul is still single-threaded — enable `cpu-blas` (compiles a
 # vendored OpenBLAS, no system deps required) for multi-core matmul.
