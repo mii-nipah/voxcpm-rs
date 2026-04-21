@@ -35,6 +35,12 @@ fn backend_name() -> &'static str {
 }
 
 fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(
+            "info,wgpu_hal=error,wgpu_core=error,naga=error,cubecl_wgpu=warn",
+        ),
+    )
+    .init();
     let mut args = env::args().skip(1);
     let model_dir = args
         .next()

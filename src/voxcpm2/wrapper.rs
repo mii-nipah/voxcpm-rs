@@ -160,6 +160,10 @@ impl<B: Backend> VoxCPM<B> {
     /// - `tokenizer.json` — a HuggingFace `tokenizers` file.
     /// - `model.safetensors` — the main model weights.
     /// - `audiovae.safetensors` — the AudioVAE weights.
+    ///
+    /// Weight-load progress is reported through the [`log`] crate (`info` for
+    /// the summary, `warn` for missing/unused tensors, `error` for load
+    /// errors). Wire up `env_logger`, `tracing-log`, etc. to surface them.
     pub fn from_local(path: impl AsRef<Path>, device: &B::Device) -> crate::Result<Self> {
         let path = path.as_ref();
         let config_bytes = std::fs::read_to_string(path.join("config.json"))?;
@@ -167,8 +171,8 @@ impl<B: Backend> VoxCPM<B> {
         let tokenizer = TextTokenizer::from_local(path)?;
         let mut model = VoxCpm2Model::<B>::new(config, device);
         let result = crate::weights::load_pretrained(&mut model, path)?;
-        eprintln!(
-            "voxcpm-rs: weights loaded — applied={}, skipped={}, missing={}, unused={}, errors={}",
+        log::info!(
+            "weights loaded — applied={}, skipped={}, missing={}, unused={}, errors={}",
             result.applied.len(),
             result.skipped.len(),
             result.missing.len(),
@@ -176,21 +180,21 @@ impl<B: Backend> VoxCPM<B> {
             result.errors.len(),
         );
         if !result.missing.is_empty() {
-            eprintln!("voxcpm-rs: missing module params (first 20):");
+            log::warn!("missing module params (first 20):");
             for (k, ctx) in result.missing.iter().take(20) {
-                eprintln!("  {k} [{ctx}]");
+                log::warn!("  {k} [{ctx}]");
             }
         }
         if !result.unused.is_empty() {
-            eprintln!("voxcpm-rs: unused checkpoint tensors (first 20):");
+            log::warn!("unused checkpoint tensors (first 20):");
             for k in result.unused.iter().take(20) {
-                eprintln!("  {k}");
+                log::warn!("  {k}");
             }
         }
         if !result.errors.is_empty() {
-            eprintln!("voxcpm-rs: load errors (first 20):");
+            log::error!("load errors (first 20):");
             for e in result.errors.iter().take(20) {
-                eprintln!("  {e:?}");
+                log::error!("  {e:?}");
             }
         }
         Ok(Self {
