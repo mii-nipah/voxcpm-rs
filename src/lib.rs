@@ -21,6 +21,9 @@
 //! See the [`VoxCPM`] struct for the convenience API, or the individual submodules
 //! ([`minicpm4`], [`locdit`], [`locenc`], [`audiovae`]) for low-level access.
 
+// Bumped from the default 128 because enabling burn's `fusion` + `autotune`
+// features pushes the wgpu-core / naga generic chain past the limit.
+#![recursion_limit = "256"]
 #![warn(missing_debug_implementations)]
 
 pub mod audio;

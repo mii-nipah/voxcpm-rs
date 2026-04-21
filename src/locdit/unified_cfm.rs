@@ -87,28 +87,48 @@ impl<B: Backend> UnifiedCfm<B> {
         let [b, c, time_len] = x.dims();
         let mu_dim = mu.dims()[1];
 
+        // Loop-invariant CFG inputs: `mu` (zeroed for uncond branch) and
+        // `cond` (duplicated as-is) don't change across diffusion steps, so
+        // build the batched tensors once instead of re-concatenating every
+        // step. NOTE: only `mu` is zeroed for the unconditional branch; the
+        // prefix-feat `cond` is duplicated as-is. (Matches Python's
+        // `cond_in[:b], cond_in[b:] = cond, cond`.)
+        let mu_zeros = Tensor::<B, 2>::zeros([b, mu_dim], &device);
+        let mu_in = Tensor::cat(vec![mu.clone(), mu_zeros], 0);
+        let cond_in = Tensor::cat(vec![cond.clone(), cond.clone()], 0);
+
+        // In non-mean-mode, `dt` is zero every step, so `dt_emb` is constant
+        // and we can prepare all timestep-invariant DiT inputs (projected
+        // `mu`, `cond`, `dt_emb`) once per solve. The inner loop then only
+        // re-projects `x` and `t`. Saves ~9× redundant linear/embed ops
+        // per diffusion solve.
+        let dit_cache = if !self.mean_mode {
+            let dt_zeros = Tensor::<B, 1>::zeros([2 * b], &device);
+            Some(self.estimator.prepare(mu_in.clone(), cond_in.clone(), dt_zeros))
+        } else {
+            None
+        };
+
         for step in 1..t_span.len() {
             let dphi_dt: Tensor<B, 3> = if use_cfg_zero_star && step <= zero_init_steps {
                 Tensor::zeros([b, c, time_len], &device)
             } else {
                 let x_in = Tensor::cat(vec![x.clone(), x.clone()], 0);
-                let mu_zeros = Tensor::<B, 2>::zeros([b, mu_dim], &device);
-                let mu_in = Tensor::cat(vec![mu.clone(), mu_zeros], 0);
                 let t_tensor = Tensor::<B, 1>::from_data(
                     TensorData::new(vec![t as f32; 2 * b], [2 * b]),
                     &device,
                 );
-                let dt_tensor = if self.mean_mode {
-                    Tensor::<B, 1>::from_data(TensorData::new(vec![dt as f32; 2 * b], [2 * b]), &device)
-                } else {
-                    Tensor::<B, 1>::zeros([2 * b], &device)
-                };
-                // NOTE: only `mu` is zeroed for the unconditional branch; the
-                // prefix-feat `cond` is duplicated as-is. (Matches Python's
-                // `cond_in[:b], cond_in[b:] = cond, cond`.)
-                let cond_in = Tensor::cat(vec![cond.clone(), cond.clone()], 0);
 
-                let out = self.estimator.forward(x_in, mu_in, t_tensor, cond_in, dt_tensor);
+                let out = if let Some(cache) = &dit_cache {
+                    self.estimator.forward_cached(x_in, t_tensor, cache)
+                } else {
+                    // mean_mode: dt varies per step, fall back to full forward.
+                    let dt_tensor = Tensor::<B, 1>::from_data(
+                        TensorData::new(vec![dt as f32; 2 * b], [2 * b]),
+                        &device,
+                    );
+                    self.estimator.forward(x_in, mu_in.clone(), t_tensor, cond_in.clone(), dt_tensor)
+                };
                 let pos = out.clone().narrow(0, 0, b);
                 let neg = out.narrow(0, b, b);
 

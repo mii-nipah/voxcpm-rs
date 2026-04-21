@@ -174,10 +174,11 @@ impl<B: Backend> VoxCPM<B> {
         let wav = wav.squeeze_dim::<2>(1); // [B, T_out]
         let wav = wav.squeeze_dim::<1>(0); // [T_out]
         let data = wav.into_data();
-        let samples: Vec<f32> = data
-            .as_slice::<f32>()
-            .map_err(|_| crate::Error::Other("unexpected VAE output dtype".into()))?
-            .to_vec();
+        // Backend-agnostic: VAE may produce f32, f16 or bf16 depending on
+        // the active Backend; convert to f32 for output regardless.
+        let samples: Vec<f32> = data.convert::<f32>().into_vec::<f32>().map_err(|_| {
+            crate::Error::Other("unexpected VAE output dtype".into())
+        })?;
         Ok(samples)
     }
 }

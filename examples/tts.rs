@@ -13,6 +13,8 @@
 //!   cargo run --release --example tts --no-default-features --features wgpu -- \
 //!       /home/nipah/dev/ai_space/VoxCPM2 "Hello world" /tmp/out.wav
 
+#![recursion_limit = "256"]
+
 use std::env;
 use std::time::Instant;
 
@@ -49,8 +51,12 @@ fn main() {
     let model: VoxCPM<B> = VoxCPM::from_local(&model_dir, &device).expect("load model");
     eprintln!("loaded in {:.2?}", t0.elapsed());
     eprintln!("synthesizing: {text:?}");
+    let timesteps = env::var("VOXCPM_TIMESTEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(10);
     let opts = GenerateOptions {
-        inference_timesteps: 10,
+        inference_timesteps: timesteps,
         cfg_value: 2.0,
         max_len: 500,
         ..GenerateOptions::default()
