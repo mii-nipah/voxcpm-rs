@@ -355,6 +355,7 @@ fn materialize_weight_norm(
     // concat along dim 0 (row concat) in the order (q, k, v) to match the
     // `q_size + 2*kv_size` layout the attention forward expects.
     fuse_qkv(&mut out)?;
+    fuse_gate_up(&mut out)?;
 
     let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = out
         .iter()
@@ -484,6 +485,73 @@ fn fuse_qkv(
         fused.extend_from_slice(&v_data);
 
         out.insert(qkv_key, (q_dt, fused_shape, fused));
+    }
+
+    Ok(())
+}
+
+/// Fuse `gate_proj` + `up_proj` into a single `gate_up_proj` weight.
+///
+/// Gated MLPs compute `down(silu(gate(x)) * up(x))`. `gate` and `up` share
+/// the same input and output shape (`[hidden, intermediate]` with no bias),
+/// so they can be packed into one matmul that produces a `2*intermediate`
+/// output, then split along the last dim.
+///
+/// Same byte-concat trick as `fuse_qkv`: in PyTorch row-major `[out, in]`
+/// layout, dim-0 concat is just byte append. The `PyTorchToBurnAdapter`
+/// transposes downstream into burn's `[in, out]` layout.
+fn fuse_gate_up(
+    out: &mut HashMap<String, (Dtype, Vec<usize>, Vec<u8>)>,
+) -> Result<()> {
+    let gate_keys: Vec<String> = out
+        .keys()
+        .filter(|k| k.ends_with(".gate_proj.weight"))
+        .cloned()
+        .collect();
+
+    for gate_key in gate_keys {
+        let stem = gate_key
+            .strip_suffix(".gate_proj.weight")
+            .expect("filter guarantees suffix");
+        let up_key = format!("{stem}.up_proj.weight");
+        let fused_key = format!("{stem}.gate_up_proj.weight");
+
+        if !out.contains_key(&up_key) {
+            continue;
+        }
+
+        let (g_dt, g_shape, g_data) = out.remove(&gate_key).unwrap();
+        let (u_dt, u_shape, u_data) = out.remove(&up_key).unwrap();
+
+        if g_dt != u_dt {
+            return Err(Error::Other(format!(
+                "gate/up fusion dtype mismatch at {stem}: gate={g_dt:?} up={u_dt:?}"
+            )));
+        }
+        if g_shape.len() != 2 || u_shape.len() != 2 {
+            return Err(Error::Other(format!(
+                "gate/up fusion expects 2D weights at {stem}, got {g_shape:?}/{u_shape:?}"
+            )));
+        }
+        if g_shape[1] != u_shape[1] {
+            return Err(Error::Other(format!(
+                "gate/up fusion in-features mismatch at {stem}: gate={} up={}",
+                g_shape[1], u_shape[1]
+            )));
+        }
+        if g_shape[0] != u_shape[0] {
+            return Err(Error::Other(format!(
+                "gate/up fusion out-features mismatch at {stem}: gate={} up={}",
+                g_shape[0], u_shape[0]
+            )));
+        }
+
+        let fused_shape = vec![g_shape[0] + u_shape[0], g_shape[1]];
+        let mut fused = Vec::with_capacity(g_data.len() + u_data.len());
+        fused.extend_from_slice(&g_data);
+        fused.extend_from_slice(&u_data);
+
+        out.insert(fused_key, (g_dt, fused_shape, fused));
     }
 
     Ok(())
