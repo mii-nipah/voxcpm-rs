@@ -10,15 +10,57 @@ use burn::prelude::*;
 use burn::tensor::{Int, TensorData};
 use std::path::{Path, PathBuf};
 
+/// How the model should be conditioned on prompt audio.
+///
+/// See [`VoxCPM::generate`] for what each mode does conceptually.
+#[derive(Debug, Clone, Default)]
+pub enum Prompt {
+    /// No prompt audio — the model improvises a voice.
+    #[default]
+    None,
+    /// Voice cloning via a structurally isolated reference audio prefix.
+    /// No transcript required; the wav is bracketed by `[REF_AUDIO_*]` tokens.
+    Reference {
+        /// Path to a wav file with the speaker to clone.
+        wav: PathBuf,
+    },
+    /// In-context continuation: the model literally finishes an utterance
+    /// whose start is `wav` (transcribed by `text`).
+    Continuation {
+        /// Path to a wav file containing the start of the utterance.
+        wav: PathBuf,
+        /// Transcript of `wav` — prepended to the target text before tokenization.
+        text: String,
+    },
+    /// Reference prefix *and* continuation suffix in the same sequence.
+    /// Useful when continuation alone drifts off the speaker.
+    Combined {
+        /// Reference wav (prefix, isolated by `[REF_AUDIO_*]` tokens).
+        reference_wav: PathBuf,
+        /// Continuation wav (suffix, autoregression starts from its end).
+        prompt_wav: PathBuf,
+        /// Transcript of `prompt_wav`.
+        prompt_text: String,
+    },
+}
+
+/// Sampling / decoding knobs for [`VoxCPM::generate`].
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
+    /// Classifier-free guidance scale. Higher → closer to the conditioning
+    /// (text + prompt), lower → more diverse. Typical range: `1.5..=3.0`.
     pub cfg_value: f32,
+    /// Number of Euler steps in the diffusion sampler. Linear cost; lower is
+    /// faster but quality drops below ~6.
     pub inference_timesteps: usize,
+    /// Minimum number of latent patches to generate before the stop head is
+    /// allowed to fire. Guards against immediate cutoffs on very short text.
     pub min_len: usize,
+    /// Hard upper bound on the number of latent patches per call. Each patch
+    /// is `patch_size * chunk_size / sample_rate` seconds of audio (~80 ms).
     pub max_len: usize,
-    pub prompt_wav: Option<PathBuf>,
-    pub prompt_text: Option<String>,
-    pub reference_wav: Option<PathBuf>,
+    /// Prompt-conditioning mode. See [`Prompt`].
+    pub prompt: Prompt,
 }
 
 impl Default for GenerateOptions {
@@ -28,21 +70,64 @@ impl Default for GenerateOptions {
             inference_timesteps: 10,
             min_len: 2,
             max_len: 2000,
-            prompt_wav: None,
-            prompt_text: None,
-            reference_wav: None,
+            prompt: Prompt::None,
         }
     }
 }
 
-/// Cached reference/prompt features for repeated generation.
-///
-/// Storage-only stub — `generate` does not yet consume these caches.
+impl GenerateOptions {
+    /// Start a fluent builder for `GenerateOptions`.
+    ///
+    /// ```no_run
+    /// use voxcpm_rs::{GenerateOptions, Prompt};
+    /// let opts = GenerateOptions::builder()
+    ///     .timesteps(8)
+    ///     .cfg(2.0)
+    ///     .prompt(Prompt::Reference { wav: "speaker.wav".into() })
+    ///     .build();
+    /// ```
+    pub fn builder() -> GenerateOptionsBuilder {
+        GenerateOptionsBuilder::default()
+    }
+}
+
+/// Fluent builder for [`GenerateOptions`]. Created via
+/// [`GenerateOptions::builder`].
 #[derive(Debug, Clone, Default)]
-pub struct PromptCache {
-    pub prompt_text: Option<String>,
-    pub prompt_wav: Option<PathBuf>,
-    pub reference_wav: Option<PathBuf>,
+pub struct GenerateOptionsBuilder {
+    inner: GenerateOptions,
+}
+
+impl GenerateOptionsBuilder {
+    /// Set [`GenerateOptions::cfg_value`].
+    pub fn cfg(mut self, v: f32) -> Self {
+        self.inner.cfg_value = v;
+        self
+    }
+    /// Set [`GenerateOptions::inference_timesteps`].
+    pub fn timesteps(mut self, n: usize) -> Self {
+        self.inner.inference_timesteps = n;
+        self
+    }
+    /// Set [`GenerateOptions::min_len`].
+    pub fn min_len(mut self, n: usize) -> Self {
+        self.inner.min_len = n;
+        self
+    }
+    /// Set [`GenerateOptions::max_len`].
+    pub fn max_len(mut self, n: usize) -> Self {
+        self.inner.max_len = n;
+        self
+    }
+    /// Set [`GenerateOptions::prompt`].
+    pub fn prompt(mut self, p: Prompt) -> Self {
+        self.inner.prompt = p;
+        self
+    }
+    /// Finalize into a [`GenerateOptions`].
+    pub fn build(self) -> GenerateOptions {
+        self.inner
+    }
 }
 
 #[derive(Debug)]
@@ -173,31 +258,39 @@ impl<B: Backend> VoxCPM<B> {
 
     /// Generate an audio waveform (mono `f32` samples at [`Self::sample_rate`]).
     ///
-    /// Supported modes (matching upstream `VoxCPM2Model._generate`):
-    /// - **Zero-shot** (default): no prompt audio, model improvises a voice.
-    /// - **Reference** (`opts.reference_wav`): voice cloning via a structurally
-    ///   isolated reference audio prefix (no transcript required).
-    /// - **Continuation** (`opts.prompt_wav` + `opts.prompt_text`): the model
-    ///   continues from the prompt audio in the same speaker's voice. The
-    ///   prompt text is the transcript of the prompt audio and is prepended to
-    ///   `text` before tokenization.
-    /// - **Combined** (`reference_wav` + `prompt_wav` + `prompt_text`): both
-    ///   the reference prefix and the continuation suffix.
-    ///
-    /// `prompt_wav` and `prompt_text` must be provided together.
+    /// The generation mode is selected by [`GenerateOptions::prompt`]:
+    /// - [`Prompt::None`] — zero-shot, model improvises a voice.
+    /// - [`Prompt::Reference`] — voice cloning via a structurally isolated
+    ///   reference audio prefix (no transcript required).
+    /// - [`Prompt::Continuation`] — model continues from the prompt audio in
+    ///   the same speaker's voice. The prompt's transcript is prepended to
+    ///   `text`.
+    /// - [`Prompt::Combined`] — both a reference prefix and a continuation
+    ///   suffix.
     pub fn generate(&self, text: &str, opts: GenerateOptions) -> crate::Result<Vec<f32>> {
-        if opts.prompt_wav.is_some() != opts.prompt_text.is_some() {
-            return Err(crate::Error::Unsupported(
-                "prompt_wav and prompt_text must be provided together (continuation mode)".into(),
-            ));
-        }
+        // Decompose the prompt into the (optional) reference + continuation
+        // pieces the sequence builder consumes.
+        let (ref_wav, prompt_wav, prompt_text) = match &opts.prompt {
+            Prompt::None => (None, None, None),
+            Prompt::Reference { wav } => (Some(wav.as_path()), None, None),
+            Prompt::Continuation { wav, text } => (None, Some(wav.as_path()), Some(text.as_str())),
+            Prompt::Combined {
+                reference_wav,
+                prompt_wav,
+                prompt_text,
+            } => (
+                Some(reference_wav.as_path()),
+                Some(prompt_wav.as_path()),
+                Some(prompt_text.as_str()),
+            ),
+        };
 
         let device = &self.device;
         let p = self.model.patch_size();
         let d = self.model.latent_dim();
 
         // 1) Tokenize text. In continuation modes prompt_text is prepended.
-        let full_text: String = match opts.prompt_text.as_deref() {
+        let full_text: String = match prompt_text {
             Some(pt) => format!("{pt}{text}"),
             None => text.to_string(),
         };
@@ -206,11 +299,11 @@ impl<B: Backend> VoxCPM<B> {
         let text_len = text_tokens.len();
 
         // 2) Encode optional prompt audios.
-        let ref_feat_opt = match opts.reference_wav.as_ref() {
+        let ref_feat_opt = match ref_wav {
             Some(path) => Some(self.encode_prompt_wav(path, PadMode::Right)?),
             None => None,
         };
-        let prompt_feat_opt = match opts.prompt_wav.as_ref() {
+        let prompt_feat_opt = match prompt_wav {
             Some(path) => Some(self.encode_prompt_wav(path, PadMode::Left)?),
             None => None,
         };

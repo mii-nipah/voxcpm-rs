@@ -55,12 +55,11 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10);
-    let opts = GenerateOptions {
-        inference_timesteps: timesteps,
-        cfg_value: 2.0,
-        max_len: 500,
-        ..GenerateOptions::default()
-    };
+    let opts = GenerateOptions::builder()
+        .timesteps(timesteps)
+        .cfg(2.0)
+        .max_len(500)
+        .build();
     let t1 = Instant::now();
     let wav = model.generate(&text, opts).expect("generate");
     let elapsed = t1.elapsed();

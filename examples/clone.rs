@@ -22,7 +22,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use voxcpm_rs::{audio, GenerateOptions, VoxCPM};
+use voxcpm_rs::{audio, GenerateOptions, Prompt, VoxCPM};
 
 #[cfg(feature = "wgpu")]
 type B = burn::backend::Wgpu<f32, i32>;
@@ -45,20 +45,19 @@ fn main() {
     let prompt_text = env::var("PROMPT_TEXT").ok();
     let mode = env::var("MODE").unwrap_or_else(|_| "reference".to_string());
 
-    let (reference_wav, prompt_wav, prompt_text) = match mode.as_str() {
-        "reference" => (Some(PathBuf::from(&wav)), None, None),
-        "continuation" => {
-            let pt = prompt_text.expect("MODE=continuation requires PROMPT_TEXT env var");
-            (None, Some(PathBuf::from(&wav)), Some(pt))
-        }
-        "combined" => {
-            let pt = prompt_text.expect("MODE=combined requires PROMPT_TEXT env var");
-            (
-                Some(PathBuf::from(&wav)),
-                Some(PathBuf::from(&wav)),
-                Some(pt),
-            )
-        }
+    let prompt = match mode.as_str() {
+        "reference" => Prompt::Reference {
+            wav: PathBuf::from(&wav),
+        },
+        "continuation" => Prompt::Continuation {
+            wav: PathBuf::from(&wav),
+            text: prompt_text.expect("MODE=continuation requires PROMPT_TEXT env var"),
+        },
+        "combined" => Prompt::Combined {
+            reference_wav: PathBuf::from(&wav),
+            prompt_wav: PathBuf::from(&wav),
+            prompt_text: prompt_text.expect("MODE=combined requires PROMPT_TEXT env var"),
+        },
         other => panic!("unknown MODE={other:?} (expected reference|continuation|combined)"),
     };
 
@@ -69,24 +68,18 @@ fn main() {
     eprintln!("loaded in {:.2?}", t0.elapsed());
     eprintln!("mode: {mode}");
     eprintln!("wav:  {wav}");
-    if let Some(pt) = &prompt_text {
-        eprintln!("prompt_text: {pt:?}");
-    }
     eprintln!("synthesizing: {text:?}");
 
     let timesteps = env::var("VOXCPM_TIMESTEPS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10);
-    let opts = GenerateOptions {
-        inference_timesteps: timesteps,
-        cfg_value: 2.0,
-        max_len: 500,
-        reference_wav,
-        prompt_wav,
-        prompt_text,
-        ..GenerateOptions::default()
-    };
+    let opts = GenerateOptions::builder()
+        .timesteps(timesteps)
+        .cfg(2.0)
+        .max_len(500)
+        .prompt(prompt)
+        .build();
     let t1 = Instant::now();
     let wav_out = model.generate(&text, opts).expect("generate");
     let elapsed = t1.elapsed();
