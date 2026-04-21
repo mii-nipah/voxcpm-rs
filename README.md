@@ -19,6 +19,7 @@ voxcpm_rs::audio::write_wav("out.wav", &wav, model.sample_rate())?;
 
 - [Why](#why)
 - [Quick start](#quick-start)
+  - [Model files](#model-files)
 - [Backends & features](#backends--features)
 - [API tour](#api-tour)
   - [Zero-shot synthesis](#zero-shot-synthesis)
@@ -56,7 +57,9 @@ exposing a small, idiomatic Rust API.
    ```
 
    You should end up with a directory containing `config.json`, `tokenizer.json`,
-   and the `.safetensors` weight shards.
+   `model.safetensors`, and `audiovae.pth`. The crate consumes this layout
+   **as-shipped** — no manual weight conversion step is required. See
+   [Model files](#model-files) below for the full accepted layout.
 
 2. **Add the crate:**
 
@@ -75,17 +78,22 @@ exposing a small, idiomatic Rust API.
 
    fn main() -> anyhow::Result<()> {
        let device = Default::default();
+       // Load once — takes ~20–25 s for the full model on a modern GPU.
+       // Subsequent `generate()` calls reuse the same loaded model.
        let model: VoxCPM<B> = VoxCPM::from_local("./VoxCPM2", &device)?;
 
-       let wav = model.generate(
-           "The quick brown fox jumps over the lazy dog.",
-           GenerateOptions::default(),
-       )?;
+       let wav_1 = model.generate("First sentence.",  GenerateOptions::default())?;
+       let wav_2 = model.generate("Second sentence.", GenerateOptions::default())?;
 
-       audio::write_wav("out.wav", &wav, model.sample_rate())?;
+       audio::write_wav("out1.wav", &wav_1, model.sample_rate())?;
+       audio::write_wav("out2.wav", &wav_2, model.sample_rate())?;
        Ok(())
    }
    ```
+
+   `VoxCPM::generate` takes `&self`, so one loaded model can serve any number
+   of synthesis calls — wrap it in an `Arc<VoxCPM<B>>` to share across threads
+   or request handlers.
 
 4. **Or just run the bundled example:**
 
@@ -93,6 +101,28 @@ exposing a small, idiomatic Rust API.
    cargo run --release --example tts --no-default-features --features wgpu -- \
        ./VoxCPM2 "Hello world from Rust." /tmp/out.wav
    ```
+
+### Model files
+
+`VoxCPM::from_local` expects a directory with:
+
+| File                      | Purpose                               | Format accepted                      |
+| ------------------------- | ------------------------------------- | ------------------------------------ |
+| `config.json`             | Model architecture config             | JSON                                 |
+| `tokenizer.json`          | HuggingFace tokenizer                 | JSON                                 |
+| `model.safetensors`  / `model.pth`    | LM + DiT backbone weights | SafeTensors preferred, `.pth`/`.pt` fallback |
+| `audiovae.safetensors` / `audiovae.pth` | AudioVAE decoder weights | SafeTensors preferred, `.pth` fallback   |
+
+The upstream HF repo currently ships `model.safetensors` + `audiovae.pth`; both
+work directly with no conversion. PyTorch `state_dict.`/`model.`/`module.`
+top-level container prefixes are stripped automatically.
+
+Weight loading takes ~20–25 s on first call (a 4.3 GB BF16 backbone is upcast
+to F32 for the `wgpu` backend — WGSL has no BF16 type). The cost is paid
+**once** per `from_local`; subsequent `generate()` calls are free of any I/O.
+Load-phase progress is reported via the [`log`](https://crates.io/crates/log)
+crate, so wiring up `env_logger` / `tracing-log` surfaces it.
+
 
 ## Backends & features
 
@@ -207,9 +237,9 @@ text ──► tokenizer ──► minicpm4 (LM backbone) ──► locenc ─�
 | [`audiovae`](src/audiovae/)           | VAE decoder that turns FSQ patches into 16 kHz audio.  |
 | [`voxcpm2`](src/voxcpm2/)             | Glue + convenient [`VoxCPM`](src/voxcpm2/wrapper.rs) façade. |
 
-Weights are loaded directly from `.safetensors` via
+Weights are loaded directly from `.safetensors` or `.pth` via
 [`burn-store`](https://crates.io/crates/burn-store) with the `PyTorchToBurnAdapter`,
-so PyTorch checkpoints drop in with no manual conversion step.
+so HuggingFace checkpoints drop in with no manual conversion step.
 
 ## Examples
 

@@ -44,15 +44,20 @@ fn target_float_dtype<B: Backend>() -> Dtype {
 }
 
 /// Load pretrained weights for a [`crate::VoxCpm2Model`] from a snapshot
-/// directory containing `model.safetensors` and (optionally)
-/// `audiovae.safetensors`.
+/// directory.
+///
+/// Accepts the upstream [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)
+/// HuggingFace layout as-shipped. Required files in `snapshot_dir`:
+///
+/// - `model.safetensors` **or** `model.pth` / `model.pt` — main model weights.
+/// - `audiovae.safetensors` **or** `audiovae.pth` — AudioVAE weights.
+///   (The HF repo currently ships `audiovae.pth`; `.safetensors` is preferred
+///   when both are present.)
 pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     snapshot_dir: impl AsRef<Path>,
 ) -> Result<ApplyResult> {
     let dir = snapshot_dir.as_ref();
-    let model_path = dir.join("model.safetensors");
-    let vae_path = dir.join("audiovae.safetensors");
     let target_dtype = target_float_dtype::<B>();
 
     let mut result = ApplyResult {
@@ -63,22 +68,52 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
         errors: Vec::new(),
     };
 
-    if model_path.exists() {
-        let r = load_single(model, &model_path, None, None, target_dtype)?;
+    // Main model weights: prefer safetensors, fall back to pth/pt.
+    let model_st = dir.join("model.safetensors");
+    let model_pth = dir.join("model.pth");
+    let model_pt = dir.join("model.pt");
+    if model_st.exists() {
+        let r = load_single(model, &model_st, None, None, target_dtype)?;
+        merge_apply_result(&mut result, r);
+    } else if model_pth.exists() {
+        let r = load_single_pth(model, &model_pth, None, None, target_dtype)?;
+        merge_apply_result(&mut result, r);
+    } else if model_pt.exists() {
+        let r = load_single_pth(model, &model_pt, None, None, target_dtype)?;
         merge_apply_result(&mut result, r);
     } else {
-        return Err(Error::NotFound(format!("{}", model_path.display())));
+        return Err(Error::NotFound(format!(
+            "no model weights found in {} (expected model.safetensors or model.pth)",
+            dir.display()
+        )));
     }
 
-    if vae_path.exists() {
+    // AudioVAE weights: same preference.
+    let vae_st = dir.join("audiovae.safetensors");
+    let vae_pth = dir.join("audiovae.pth");
+    if vae_st.exists() {
         let r = load_single(
             model,
-            &vae_path,
+            &vae_st,
             Some("audio_vae."),
             Some(remap_audiovae_key),
             target_dtype,
         )?;
         merge_apply_result(&mut result, r);
+    } else if vae_pth.exists() {
+        let r = load_single_pth(
+            model,
+            &vae_pth,
+            Some("audio_vae."),
+            Some(remap_audiovae_key),
+            target_dtype,
+        )?;
+        merge_apply_result(&mut result, r);
+    } else {
+        log::warn!(
+            "no audiovae weights found in {} (expected audiovae.safetensors or audiovae.pth) — audio decoding will use random weights",
+            dir.display()
+        );
     }
 
     // burn-store reports `missing` per file (any model param not supplied
@@ -246,24 +281,114 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let st = SafeTensors::deserialize(&mmap)?;
+    let tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = st
+        .names()
+        .iter()
+        .map(|name| {
+            let view = st
+                .tensor(name)
+                .map_err(|_| Error::MissingWeight(name.to_string()))?;
+            Ok((
+                name.to_string(),
+                view.shape().to_vec(),
+                view.dtype(),
+                view.data().to_vec(),
+            ))
+        })
+        .collect::<Result<_>>()?;
     log::debug!("weights[{}] mmap+parse: {:.2?}", path.display(), t0.elapsed());
+    drop(st);
+    drop(mmap);
+    repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
+}
+
+/// Load a PyTorch pickle checkpoint (`.pt` / `.pth`) via [`burn_store`]'s
+/// [`PytorchReader`], then funnel the tensors through the same
+/// `materialize_weight_norm` + burn-store apply path used for safetensors.
+///
+/// Lets the crate consume HuggingFace distributions as-shipped when the
+/// repo publishes only `.pth` files (e.g. `audiovae.pth` in
+/// [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)), so no manual
+/// pth→safetensors conversion step is required on the user's side.
+fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
+    model: &mut M,
+    path: &Path,
+    prefix: Option<&str>,
+    remap: Option<fn(&str) -> Option<String>>,
+    target_float_dtype: Dtype,
+) -> Result<ApplyResult> {
+    use burn_store::pytorch::PytorchReader;
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    let reader = PytorchReader::new(path)
+        .map_err(|e| Error::Other(format!("read pytorch file `{}`: {e}", path.display())))?;
+    let mut tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::with_capacity(reader.len());
+    for (name, snapshot) in reader.tensors() {
+        let td = snapshot
+            .to_data()
+            .map_err(|e| Error::Other(format!("materialize `{name}` from pth: {e:?}")))?;
+        let dtype = burn_dtype_to_safetensors(td.dtype)?;
+        // Many HF-published `.pth` files wrap the weights under a top-level
+        // dict (e.g. `state_dict`, `model`, `model_state_dict`). Strip the
+        // common ones so downstream remapping sees bare parameter paths.
+        let bare = strip_pth_top_level(name);
+        tensors.push((bare.to_string(), td.shape.clone(), dtype, td.as_bytes().to_vec()));
+    }
+    log::debug!(
+        "weights[{}] read-pth: {:.2?} ({} tensors)",
+        path.display(),
+        t0.elapsed(),
+        tensors.len()
+    );
+    repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
+}
+
+fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {    use burn::tensor::DType as B;
+    Ok(match dt {
+        B::F64 => Dtype::F64,
+        B::F32 | B::Flex32 => Dtype::F32,
+        B::F16 => Dtype::F16,
+        B::BF16 => Dtype::BF16,
+        B::I64 => Dtype::I64,
+        B::I32 => Dtype::I32,
+        B::I16 => Dtype::I16,
+        B::I8 => Dtype::I8,
+        B::U64 => Dtype::U64,
+        B::U32 => Dtype::U32,
+        B::U16 => Dtype::U16,
+        B::U8 => Dtype::U8,
+        B::Bool => Dtype::BOOL,
+        other => {
+            return Err(Error::Unsupported(format!(
+                "burn DType {other:?} has no safetensors equivalent"
+            )));
+        }
+    })
+}
+
+fn repack_and_apply<B: Backend, M: ModuleSnapshot<B>>(
+    model: &mut M,
+    path: &Path,
+    tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)>,
+    prefix: Option<&str>,
+    remap: Option<fn(&str) -> Option<String>>,
+    target_float_dtype: Dtype,
+) -> Result<ApplyResult> {
+    use std::time::Instant;
     let t1 = Instant::now();
-    let synth_bytes = materialize_weight_norm(&st, prefix, remap, target_float_dtype)?;
+    let synth_bytes = materialize_weight_norm(tensors, prefix, remap, target_float_dtype)?;
     log::debug!(
         "weights[{}] materialize+repack: {:.2?} ({} MB)",
         path.display(),
         t1.elapsed(),
         synth_bytes.len() / (1024 * 1024)
     );
-    drop(st);
-    drop(mmap);
 
     let t2 = Instant::now();
-
     let mut store = SafetensorsStore::from_bytes(Some(synth_bytes))
         .with_from_adapter(PyTorchToBurnAdapter)
         .allow_partial(true);
-
     let r = model.load_from(&mut store).map_err(map_store_err);
     log::debug!("weights[{}] burn-store apply: {:.2?}", path.display(), t2.elapsed());
     r
@@ -273,13 +398,26 @@ fn map_store_err(e: SafetensorsStoreError) -> Error {
     Error::Other(format!("safetensors store: {e}"))
 }
 
+/// Strip a common top-level container prefix that HF-published PyTorch
+/// checkpoints often use (e.g. `state_dict.`, `model.`, `model_state_dict.`)
+/// so the downstream name→module remapping can operate on bare keys.
+/// No-op if no known prefix matches.
+fn strip_pth_top_level(name: &str) -> &str {
+    for prefix in ["state_dict.", "model_state_dict.", "module."] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    name
+}
+
 /// Read a safetensors file, expanding `weight_norm` parameter pairs
 /// (`X.weight_g` + `X.weight_v`) into their materialized `X.weight`. All
 /// other tensors are passed through unchanged. If `prefix` is provided, it
 /// is prepended to every key in the output. Returns a fresh serialized
 /// safetensors buffer.
 fn materialize_weight_norm(
-    st: &SafeTensors<'_>,
+    tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)>,
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
@@ -290,18 +428,13 @@ fn materialize_weight_norm(
     let mut weight_v: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
     let mut plain: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::new();
 
-    for name in st.names() {
-        let view = st
-            .tensor(name)
-            .map_err(|_| Error::MissingWeight(name.to_string()))?;
-        let shape = view.shape().to_vec();
-        let data = view.data().to_vec();
+    for (name, shape, dtype, data) in tensors {
         if let Some(stem) = name.strip_suffix(".weight_g") {
-            weight_g.insert(stem.to_string(), (shape, decode_f32(view.dtype(), &data)?));
+            weight_g.insert(stem.to_string(), (shape, decode_f32(dtype, &data)?));
         } else if let Some(stem) = name.strip_suffix(".weight_v") {
-            weight_v.insert(stem.to_string(), (shape, decode_f32(view.dtype(), &data)?));
+            weight_v.insert(stem.to_string(), (shape, decode_f32(dtype, &data)?));
         } else {
-            plain.push((name.to_string(), shape, view.dtype(), data));
+            plain.push((name, shape, dtype, data));
         }
     }
 

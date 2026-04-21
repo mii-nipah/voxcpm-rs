@@ -1,6 +1,6 @@
 [package]
 name = "voxcpm-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Pure-Rust inference for VoxCPM2 on top of the Burn framework (Vulkan + CPU)."
@@ -43,7 +43,7 @@ all-backends = ["wgpu", "cpu"]
 
 [dependencies]
 burn = { version = "0.20.1", default-features = false, features = ["std"] }
-burn-store = { version = "0.20.1", default-features = false, features = ["safetensors", "std"] }
+burn-store = { version = "0.20.1", default-features = false, features = ["safetensors", "pytorch", "std"] }
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
