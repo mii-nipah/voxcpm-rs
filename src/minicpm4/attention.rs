@@ -82,7 +82,7 @@ impl<B: Backend> MiniCpmAttention<B> {
         hidden_states: Tensor<B, 2>,
         position_emb: Option<(Tensor<B, 2>, Tensor<B, 2>)>,
         position_id: usize,
-        kv_cache: &mut LayerKv<B>,
+        kv_cache: &mut Option<LayerKv<B>>,
     ) -> Tensor<B, 2> {
         let [bsz, _] = hidden_states.dims();
         let device = hidden_states.device();
@@ -101,27 +101,40 @@ impl<B: Backend> MiniCpmAttention<B> {
             (q, k)
         };
 
-        let (key_cache, value_cache) = kv_cache;
-        *key_cache = key_cache.clone().slice_assign(
+        // Take ownership of the cache buffers so refcount drops to 1 and
+        // `slice_assign` can reuse the underlying GPU allocation in place.
+        let (key_cache, value_cache) = kv_cache.take().expect("cache layer present");
+        let key_cache = key_cache.slice_assign(
             [0..bsz, 0..self.num_kv_heads, position_id..position_id + 1, 0..self.head_dim],
             k,
         );
-        *value_cache = value_cache.clone().slice_assign(
+        let value_cache = value_cache.slice_assign(
             [0..bsz, 0..self.num_kv_heads, position_id..position_id + 1, 0..self.head_dim],
             v,
         );
 
         let max_len = key_cache.dims()[2];
 
-        let idx = Tensor::<B, 1, Int>::arange(0..max_len as i64, &device);
-        let mask = idx.greater_elem(position_id as i64); // [max_len], true where masked
-        let mask: Tensor<B, 4, burn::tensor::Bool> = mask.unsqueeze();
-
         let n_rep = self.num_heads / self.num_kv_heads;
-        let k_full = repeat_kv(key_cache.clone(), n_rep);
-        let v_full = repeat_kv(value_cache.clone(), n_rep);
+        // Slice cache to the populated range so SDPA only attends over actual
+        // positions (avoids O(max_length) compute every step).
+        let cur_len = position_id + 1;
+        let k_view = key_cache
+            .clone()
+            .slice([0..bsz, 0..self.num_kv_heads, 0..cur_len, 0..self.head_dim]);
+        let v_view = value_cache
+            .clone()
+            .slice([0..bsz, 0..self.num_kv_heads, 0..cur_len, 0..self.head_dim]);
+        let k_full = repeat_kv(k_view, n_rep);
+        let v_full = repeat_kv(v_view, n_rep);
 
-        let attn = self.sdpa(q, k_full, v_full, false, Some(mask));
+        // Restore the (single-ref) buffers to the cache before consuming the
+        // clones in SDPA — this lets the next step's slice_assign be in-place.
+        *kv_cache = Some((key_cache, value_cache));
+
+        // No mask needed: cache is sliced to exactly the valid range.
+        let _ = (max_len, device);
+        let attn = self.sdpa(q, k_full, v_full, false, None);
 
         let attn = attn.swap_dims(1, 2).reshape([bsz, self.num_heads * self.head_dim]);
         self.o_proj.forward(attn)

@@ -59,7 +59,7 @@ impl<B: Backend> MiniCpmDecoderLayer<B> {
         hidden_states: Tensor<B, 2>,
         position_emb: Option<(Tensor<B, 2>, Tensor<B, 2>)>,
         position_id: usize,
-        kv_cache: &mut LayerKv<B>,
+        kv_cache: &mut Option<LayerKv<B>>,
     ) -> Tensor<B, 2> {
         let residual = hidden_states.clone();
         let h = self.input_layernorm.forward(hidden_states);

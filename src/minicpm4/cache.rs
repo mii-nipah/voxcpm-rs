@@ -7,7 +7,10 @@ pub type LayerKv<B> = (Tensor<B, 4>, Tensor<B, 4>);
 
 #[derive(Debug)]
 pub struct StaticKvCache<B: Backend> {
-    pub layers: Vec<LayerKv<B>>,
+    /// `Option` lets us `take()` the inner tensors during a step so the
+    /// reference count drops to 1, allowing `slice_assign` to recycle the
+    /// underlying buffer instead of copying it.
+    pub layers: Vec<Option<LayerKv<B>>>,
     pub current_length: usize,
     pub max_length: usize,
     pub num_kv_heads: usize,
@@ -25,10 +28,10 @@ impl<B: Backend> StaticKvCache<B> {
     ) -> Self {
         let layers = (0..num_layers)
             .map(|_| {
-                (
+                Some((
                     Tensor::zeros([batch_size, num_kv_heads, max_length, head_dim], device),
                     Tensor::zeros([batch_size, num_kv_heads, max_length, head_dim], device),
-                )
+                ))
             })
             .collect();
         Self {
@@ -46,12 +49,11 @@ impl<B: Backend> StaticKvCache<B> {
         let s = prefill[0].0.dims()[2];
         self.current_length = s;
         for (dst, src) in self.layers.iter_mut().zip(prefill) {
-            let [b, h, _, d] = dst.0.dims();
-            let device = dst.0.device();
-            let zero_k: Tensor<B, 4> = Tensor::zeros(dst.0.dims(), &device);
-            let zero_v: Tensor<B, 4> = Tensor::zeros(dst.1.dims(), &device);
-            dst.0 = zero_k.slice_assign([0..b, 0..h, 0..s, 0..d], src.0);
-            dst.1 = zero_v.slice_assign([0..b, 0..h, 0..s, 0..d], src.1);
+            let (dst_k, dst_v) = dst.take().expect("cache layer present");
+            let [b, h, _, d] = dst_k.dims();
+            let new_k = dst_k.slice_assign([0..b, 0..h, 0..s, 0..d], src.0);
+            let new_v = dst_v.slice_assign([0..b, 0..h, 0..s, 0..d], src.1);
+            *dst = Some((new_k, new_v));
         }
     }
 
@@ -66,7 +68,7 @@ impl<B: Backend> StaticKvCache<B> {
         self.current_length = 0;
     }
 
-    pub fn layer_mut(&mut self, idx: usize) -> &mut LayerKv<B> {
+    pub fn layer_mut(&mut self, idx: usize) -> &mut Option<LayerKv<B>> {
         &mut self.layers[idx]
     }
 }
