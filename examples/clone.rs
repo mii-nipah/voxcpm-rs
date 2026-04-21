@@ -1,15 +1,20 @@
-//! Voice cloning smoke test: generate speech in the voice of a reference wav.
+//! Voice cloning smoke test: generate speech using a reference and/or prompt wav.
+//!
+//! Modes (controlled via env vars):
+//!   - **Reference** (default): isolates the reference voice via REF_AUDIO tokens.
+//!     No transcript needed.
+//!   - **Continuation**: set `PROMPT_TEXT` to the transcript of the wav.
+//!     Model continues from the prompt audio in the same speaker's voice.
+//!     Set `MODE=continuation` to use the wav as a continuation prompt only.
+//!   - **Combined**: set `MODE=combined` and `PROMPT_TEXT`. Uses the wav as
+//!     both a reference prefix and a continuation prompt.
 //!
 //! Usage:
 //!   cargo run --release --example clone --no-default-features --features wgpu -- \
-//!       <model_dir> <ref_wav> "target text" /tmp/out.wav
+//!       <model_dir> <wav> "target text" /tmp/out.wav
 //!
-//! Example:
-//!   cargo run --release --example clone --no-default-features --features wgpu -- \
-//!       /home/nipah/dev/ai_space/VoxCPM2 \
-//!       vendor/VoxCPM/examples/reference_speaker.wav \
-//!       "Hello world, this is a voice cloning test." \
-//!       /tmp/clone.wav
+//!   PROMPT_TEXT="..." MODE=continuation cargo run ... -- ...
+//!   PROMPT_TEXT="..." MODE=combined     cargo run ... -- ...
 
 #![recursion_limit = "256"]
 
@@ -29,7 +34,7 @@ fn main() {
     let model_dir = args
         .next()
         .unwrap_or_else(|| "/home/nipah/dev/ai_space/VoxCPM2".to_string());
-    let ref_wav = args
+    let wav = args
         .next()
         .unwrap_or_else(|| "vendor/VoxCPM/examples/reference_speaker.wav".to_string());
     let text = args
@@ -37,12 +42,36 @@ fn main() {
         .unwrap_or_else(|| "Hello world, this is a voice cloning test.".to_string());
     let out = args.next().unwrap_or_else(|| "/tmp/clone.wav".to_string());
 
+    let prompt_text = env::var("PROMPT_TEXT").ok();
+    let mode = env::var("MODE").unwrap_or_else(|_| "reference".to_string());
+
+    let (reference_wav, prompt_wav, prompt_text) = match mode.as_str() {
+        "reference" => (Some(PathBuf::from(&wav)), None, None),
+        "continuation" => {
+            let pt = prompt_text.expect("MODE=continuation requires PROMPT_TEXT env var");
+            (None, Some(PathBuf::from(&wav)), Some(pt))
+        }
+        "combined" => {
+            let pt = prompt_text.expect("MODE=combined requires PROMPT_TEXT env var");
+            (
+                Some(PathBuf::from(&wav)),
+                Some(PathBuf::from(&wav)),
+                Some(pt),
+            )
+        }
+        other => panic!("unknown MODE={other:?} (expected reference|continuation|combined)"),
+    };
+
     let device = Default::default();
     let t0 = Instant::now();
     eprintln!("loading model from {model_dir} ...");
     let model: VoxCPM<B> = VoxCPM::from_local(&model_dir, &device).expect("load model");
     eprintln!("loaded in {:.2?}", t0.elapsed());
-    eprintln!("reference: {ref_wav}");
+    eprintln!("mode: {mode}");
+    eprintln!("wav:  {wav}");
+    if let Some(pt) = &prompt_text {
+        eprintln!("prompt_text: {pt:?}");
+    }
     eprintln!("synthesizing: {text:?}");
 
     let timesteps = env::var("VOXCPM_TIMESTEPS")
@@ -53,23 +82,26 @@ fn main() {
         inference_timesteps: timesteps,
         cfg_value: 2.0,
         max_len: 500,
-        reference_wav: Some(PathBuf::from(&ref_wav)),
+        reference_wav,
+        prompt_wav,
+        prompt_text,
         ..GenerateOptions::default()
     };
     let t1 = Instant::now();
-    let wav = model.generate(&text, opts).expect("generate");
+    let wav_out = model.generate(&text, opts).expect("generate");
     let elapsed = t1.elapsed();
     let sr = model.sample_rate();
-    let audio_sec = wav.len() as f32 / sr as f32;
+    let audio_sec = wav_out.len() as f32 / sr as f32;
     eprintln!(
         "got {} samples @ {} Hz ({:.2}s of audio) in {:.2?} (RTF = {:.2})",
-        wav.len(),
+        wav_out.len(),
         sr,
         audio_sec,
         elapsed,
         elapsed.as_secs_f32() / audio_sec
     );
     eprintln!("writing {out}");
-    audio::write_wav(&out, &wav, sr).expect("write wav");
+    audio::write_wav(&out, &wav_out, sr).expect("write wav");
     eprintln!("done");
 }
+

@@ -125,10 +125,15 @@ impl<B: Backend> VoxCPM<B> {
         self.model.audio_vae.decode(feat)
     }
 
-    /// Encode a reference wav into latent patches `[T, P, D]` for voice
-    /// cloning. Right-pads audio to a multiple of `patch_size * chunk_size`
-    /// before VAE encoding (matches upstream `_encode_wav(padding_mode="right")`).
-    fn encode_reference_wav(&self, wav_path: &Path) -> crate::Result<Tensor<B, 3>> {
+    /// Padding mode for prompt audio prior to VAE encoding.
+    /// - `Right`: pad zeros at the end (used for reference audio in voice cloning).
+    /// - `Left`: pad zeros at the start so the *valid* audio sits at the end of
+    ///   the sequence (used for continuation prompts).
+    fn encode_prompt_wav(
+        &self,
+        wav_path: &Path,
+        padding_mode: PadMode,
+    ) -> crate::Result<Tensor<B, 3>> {
         let encoder_sr = self.model.audio_vae.sample_rate() as u32;
         let mut samples = crate::audio::load_audio_as(wav_path, encoder_sr)?;
         let p = self.model.patch_size();
@@ -137,13 +142,21 @@ impl<B: Backend> VoxCPM<B> {
         let n = samples.len();
         if n == 0 {
             return Err(crate::Error::AudioDecode(format!(
-                "reference audio decoded to 0 samples: {}",
+                "prompt audio decoded to 0 samples: {}",
                 wav_path.display()
             )));
         }
         let rem = n % patch_len;
         if rem != 0 {
-            samples.resize(n + (patch_len - rem), 0.0);
+            let pad = patch_len - rem;
+            match padding_mode {
+                PadMode::Right => samples.resize(n + pad, 0.0),
+                PadMode::Left => {
+                    let mut new = vec![0.0f32; pad];
+                    new.extend_from_slice(&samples);
+                    samples = new;
+                }
+            }
         }
         let n_padded = samples.len();
         let audio: Tensor<B, 3> =
@@ -160,17 +173,22 @@ impl<B: Backend> VoxCPM<B> {
 
     /// Generate an audio waveform (mono `f32` samples at [`Self::sample_rate`]).
     ///
-    /// Supported modes:
+    /// Supported modes (matching upstream `VoxCPM2Model._generate`):
     /// - **Zero-shot** (default): no prompt audio, model improvises a voice.
     /// - **Reference** (`opts.reference_wav`): voice cloning via a structurally
     ///   isolated reference audio prefix (no transcript required).
+    /// - **Continuation** (`opts.prompt_wav` + `opts.prompt_text`): the model
+    ///   continues from the prompt audio in the same speaker's voice. The
+    ///   prompt text is the transcript of the prompt audio and is prepended to
+    ///   `text` before tokenization.
+    /// - **Combined** (`reference_wav` + `prompt_wav` + `prompt_text`): both
+    ///   the reference prefix and the continuation suffix.
     ///
-    /// `opts.prompt_wav` + `opts.prompt_text` (continuation mode) is not yet
-    /// supported and returns [`Error::Unsupported`].
+    /// `prompt_wav` and `prompt_text` must be provided together.
     pub fn generate(&self, text: &str, opts: GenerateOptions) -> crate::Result<Vec<f32>> {
-        if opts.prompt_wav.is_some() || opts.prompt_text.is_some() {
+        if opts.prompt_wav.is_some() != opts.prompt_text.is_some() {
             return Err(crate::Error::Unsupported(
-                "prompt_wav / prompt_text (continuation mode) is not yet supported".into(),
+                "prompt_wav and prompt_text must be provided together (continuation mode)".into(),
             ));
         }
 
@@ -178,65 +196,78 @@ impl<B: Backend> VoxCPM<B> {
         let p = self.model.patch_size();
         let d = self.model.latent_dim();
 
-        // 1) Tokenize target text + AUDIO_START.
-        let mut text_tokens = self.tokenizer.encode(text)?;
+        // 1) Tokenize text. In continuation modes prompt_text is prepended.
+        let full_text: String = match opts.prompt_text.as_deref() {
+            Some(pt) => format!("{pt}{text}"),
+            None => text.to_string(),
+        };
+        let mut text_tokens = self.tokenizer.encode(&full_text)?;
         text_tokens.push(AUDIO_START_TOKEN);
         let text_len = text_tokens.len();
 
-        // 2) Optionally encode reference audio into latent patches.
+        // 2) Encode optional prompt audios.
         let ref_feat_opt = match opts.reference_wav.as_ref() {
-            Some(path) => Some(self.encode_reference_wav(path)?),
+            Some(path) => Some(self.encode_prompt_wav(path, PadMode::Right)?),
+            None => None,
+        };
+        let prompt_feat_opt = match opts.prompt_wav.as_ref() {
+            Some(path) => Some(self.encode_prompt_wav(path, PadMode::Left)?),
             None => None,
         };
 
         // 3) Build the full sequence of tokens / masks / feats.
-        let (tokens, text_mask_vals, feat_mask_vals, feat_seq) = if let Some(ref_feat) = ref_feat_opt
-        {
-            let ref_len = ref_feat.dims()[0];
+        let z_patch = |n: usize| -> Tensor<B, 3> { Tensor::<B, 3>::zeros([n, p, d], device) };
 
-            // tokens: [REF_START, 0×ref_len, REF_END, text_tokens...]
-            let mut tokens = Vec::with_capacity(2 + ref_len + text_len);
+        let mut tokens: Vec<i64> = Vec::new();
+        let mut t_mask: Vec<f32> = Vec::new();
+        let mut f_mask: Vec<f32> = Vec::new();
+        let mut feat_chunks: Vec<Tensor<B, 3>> = Vec::new();
+
+        // [a] Optional reference prefix: [REF_START, ref×N, REF_END]
+        if let Some(ref_feat) = ref_feat_opt {
+            let ref_len = ref_feat.dims()[0];
             tokens.push(REF_AUDIO_START_TOKEN);
             tokens.extend(std::iter::repeat_n(0i64, ref_len));
             tokens.push(REF_AUDIO_END_TOKEN);
-            tokens.extend_from_slice(&text_tokens);
-
-            // text_mask: [1, 0×ref_len, 1, 1×text_len]
-            let mut t_mask: Vec<f32> = Vec::with_capacity(tokens.len());
             t_mask.push(1.0);
             t_mask.extend(std::iter::repeat_n(0.0, ref_len));
             t_mask.push(1.0);
-            t_mask.extend(std::iter::repeat_n(1.0, text_len));
-
-            // feat_mask: [0, 1×ref_len, 0, 0×text_len]
-            let mut f_mask: Vec<f32> = Vec::with_capacity(tokens.len());
             f_mask.push(0.0);
             f_mask.extend(std::iter::repeat_n(1.0, ref_len));
             f_mask.push(0.0);
-            f_mask.extend(std::iter::repeat_n(0.0, text_len));
+            feat_chunks.push(z_patch(1));
+            feat_chunks.push(ref_feat);
+            feat_chunks.push(z_patch(1));
+        }
 
-            // feat: [z1, ref_feat, z1, text_pad] all [*, P, D]
-            let z1 = Tensor::<B, 3>::zeros([1, p, d], device);
-            let text_pad = Tensor::<B, 3>::zeros([text_len, p, d], device);
-            let feat =
-                Tensor::cat(vec![z1.clone(), ref_feat, z1, text_pad], 0); // [S, P, D]
+        // [b] Text tokens (always present).
+        tokens.extend_from_slice(&text_tokens);
+        t_mask.extend(std::iter::repeat_n(1.0, text_len));
+        f_mask.extend(std::iter::repeat_n(0.0, text_len));
+        feat_chunks.push(z_patch(text_len));
 
-            (tokens, t_mask, f_mask, feat)
-        } else {
-            // Zero-shot: all positions are text.
-            let t_mask = vec![1.0f32; text_len];
-            let f_mask = vec![0.0f32; text_len];
-            let feat = Tensor::<B, 3>::zeros([text_len, p, d], device);
-            (text_tokens, t_mask, f_mask, feat)
-        };
+        // [c] Optional continuation suffix: zero text-tokens at the audio
+        //     positions, ones in the audio mask, and the prompt latent patches.
+        if let Some(prompt_feat) = prompt_feat_opt {
+            let prompt_len = prompt_feat.dims()[0];
+            tokens.extend(std::iter::repeat_n(0i64, prompt_len));
+            t_mask.extend(std::iter::repeat_n(0.0, prompt_len));
+            f_mask.extend(std::iter::repeat_n(1.0, prompt_len));
+            feat_chunks.push(prompt_feat);
+        }
 
         let s = tokens.len();
+        let feat_seq = if feat_chunks.len() == 1 {
+            feat_chunks.pop().unwrap()
+        } else {
+            Tensor::cat(feat_chunks, 0)
+        };
         let text_token_t: Tensor<B, 2, Int> =
             Tensor::from_data(TensorData::new(tokens, [1, s]), device);
         let text_mask_t: Tensor<B, 2> =
-            Tensor::from_data(TensorData::new(text_mask_vals, [1, s]), device);
+            Tensor::from_data(TensorData::new(t_mask, [1, s]), device);
         let feat_mask_t: Tensor<B, 2> =
-            Tensor::from_data(TensorData::new(feat_mask_vals, [1, s]), device);
+            Tensor::from_data(TensorData::new(f_mask, [1, s]), device);
         let feat_t: Tensor<B, 4> = feat_seq.unsqueeze_dim(0); // [1, S, P, D]
 
         // 4) Run the main inference loop: latent patches → [B, D, T*P].
@@ -264,5 +295,11 @@ impl<B: Backend> VoxCPM<B> {
             .map_err(|_| crate::Error::Other("unexpected VAE output dtype".into()))?;
         Ok(samples)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PadMode {
+    Right,
+    Left,
 }
 
