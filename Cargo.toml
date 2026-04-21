@@ -2,6 +2,36 @@
 name = "voxcpm-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Pure-Rust inference for VoxCPM2 on top of the Burn framework (Vulkan + CPU)."
+license = "Apache-2.0"
+
+[features]
+default = ["cpu"]
+# Vulkan / WGPU backend (primary target: AMD + NVIDIA via wgpu)
+wgpu = ["burn/wgpu"]
+# Pure-CPU fallback using ndarray
+cpu = ["burn/ndarray"]
+# Convenience: enable both
+all-backends = ["wgpu", "cpu"]
 
 [dependencies]
-burn = "0.20.1"
+burn = { version = "0.20.1", default-features = false, features = ["std"] }
+burn-store = { version = "0.20.1", default-features = false, features = ["safetensors", "std"] }
+safetensors = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# HF tokenizer loader (reads tokenizer.json produced by LlamaTokenizerFast)
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+# Audio I/O & resampling
+hound = "3"
+symphonia = { version = "0.5", features = ["all"] }
+rubato = "0.15"
+# Misc
+half = "2"
+log = "0.4"
+bytemuck = "1"
+memmap2 = "0.9"
+
+[dev-dependencies]
+approx = "0.5"
