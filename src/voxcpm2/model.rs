@@ -238,8 +238,24 @@ impl<B: Backend> VoxCpm2Model<B> {
             let stop_logits = self
                 .stop_head
                 .forward(burn::tensor::activation::silu(self.stop_proj.forward(lm_hidden.clone()))); // [B, 2]
-            let stop_arg = stop_logits.argmax(1);
-            let stop: i64 = stop_arg.into_data().as_slice::<i64>().map(|s| s[0]).unwrap_or(0);
+            let stop_arg = stop_logits.clone().argmax(1);
+            // Backend-agnostic int read: argmax tensor's elem type may be i32 (wgpu)
+            // or i64 (ndarray). `into_data()` yields a TensorData; use `iter::<i64>()`
+            // which converts whatever the underlying dtype is.
+            let stop: i64 = stop_arg
+                .into_data()
+                .iter::<i64>()
+                .next()
+                .unwrap_or(0);
+            if std::env::var("VOXCPM_DEBUG_STOP").is_ok() {
+                let d = stop_logits.into_data();
+                let sl = d.as_slice::<f32>().unwrap_or(&[]);
+                let lh = lm_hidden.clone().into_data();
+                let lhs = lh.as_slice::<f32>().unwrap_or(&[]);
+                let lh_abs_max = lhs.iter().fold(0f32, |a, &b| a.max(b.abs()));
+                let lh_first: Vec<f32> = lhs.iter().take(4).copied().collect();
+                eprintln!("step {i:4} stop={stop} logits=[{:.3}, {:.3}] lm_abs_max={:.3} lm[:4]={:?}", sl.first().copied().unwrap_or(0.0), sl.get(1).copied().unwrap_or(0.0), lh_abs_max, lh_first);
+            }
             if i > min_len && stop == 1 {
                 break;
             }
