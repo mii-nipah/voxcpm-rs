@@ -207,7 +207,7 @@ pub struct VoxCpmDitConfig {
     pub num_layers: usize,
     #[serde(default)]
     pub kv_channels: Option<usize>,
-    #[serde(default)]
+    #[serde(default, alias = "mean_mode")]
     pub dit_mean_mode: bool,
     pub cfm_config: CfmConfig,
 }

@@ -79,7 +79,33 @@ impl<B: Backend> VoxCPM<B> {
         let config: VoxCpm2Config = serde_json::from_str(&config_bytes)?;
         let tokenizer = TextTokenizer::from_local(path)?;
         let mut model = VoxCpm2Model::<B>::new(config, device);
-        crate::weights::load_pretrained(&mut model, path)?;
+        let result = crate::weights::load_pretrained(&mut model, path)?;
+        eprintln!(
+            "voxcpm-rs: weights loaded — applied={}, skipped={}, missing={}, unused={}, errors={}",
+            result.applied.len(),
+            result.skipped.len(),
+            result.missing.len(),
+            result.unused.len(),
+            result.errors.len(),
+        );
+        if !result.missing.is_empty() {
+            eprintln!("voxcpm-rs: missing module params (first 20):");
+            for (k, ctx) in result.missing.iter().take(20) {
+                eprintln!("  {k} [{ctx}]");
+            }
+        }
+        if !result.unused.is_empty() {
+            eprintln!("voxcpm-rs: unused checkpoint tensors (first 20):");
+            for k in result.unused.iter().take(20) {
+                eprintln!("  {k}");
+            }
+        }
+        if !result.errors.is_empty() {
+            eprintln!("voxcpm-rs: load errors (first 20):");
+            for e in result.errors.iter().take(20) {
+                eprintln!("  {e:?}");
+            }
+        }
         Ok(Self {
             model,
             tokenizer,

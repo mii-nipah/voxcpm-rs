@@ -47,18 +47,146 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     };
 
     if model_path.exists() {
-        let r = load_single(model, &model_path, None)?;
+        let r = load_single(model, &model_path, None, None)?;
         merge_apply_result(&mut result, r);
     } else {
         return Err(Error::NotFound(format!("{}", model_path.display())));
     }
 
     if vae_path.exists() {
-        let r = load_single(model, &vae_path, Some("audio_vae."))?;
+        let r = load_single(model, &vae_path, Some("audio_vae."), Some(remap_audiovae_key))?;
         merge_apply_result(&mut result, r);
     }
 
     Ok(result)
+}
+
+/// Translate HF AudioVAE checkpoint keys (which follow `nn.Sequential`
+/// indexing, e.g. `decoder.model.2.block.4.block.1.weight`) to the named-
+/// field paths used by [`crate::audiovae`]. Returns `None` for tensors that
+/// have no destination on the burn side (e.g. `decoder.sr_bin_boundaries`,
+/// which is an `Ignored` buffer).
+fn remap_audiovae_key(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split('.').collect();
+
+    if parts.first().copied() == Some("decoder") {
+        if parts.len() >= 2 && parts[1] == "sr_bin_boundaries" {
+            return None;
+        }
+        if parts.len() >= 3 && parts[1] == "sr_cond_model" {
+            let hf_idx: usize = parts[2].parse().ok()?;
+            if !(2..=7).contains(&hf_idx) {
+                return None;
+            }
+            let i = hf_idx - 2;
+            let rest = parts[3..].join(".");
+            return Some(format!("decoder.sr_cond_layers.{i}.{rest}"));
+        }
+        if parts.len() >= 3 && parts[1] == "model" {
+            let hf_idx: usize = parts[2].parse().ok()?;
+            match hf_idx {
+                0 => {
+                    let rest = parts[3..].join(".");
+                    return Some(format!("decoder.first.dw.conv.{rest}"));
+                }
+                1 => {
+                    let rest = parts[3..].join(".");
+                    return Some(format!("decoder.first.pw.conv.{rest}"));
+                }
+                8 => {
+                    let rest = parts[3..].join(".");
+                    return Some(format!("decoder.snake_out.{rest}"));
+                }
+                9 => {
+                    let rest = parts[3..].join(".");
+                    return Some(format!("decoder.last.conv.{rest}"));
+                }
+                2..=7 => {
+                    let i = hf_idx - 2;
+                    if parts.len() < 5 || parts[3] != "block" {
+                        return None;
+                    }
+                    let sub: usize = parts[4].parse().ok()?;
+                    match sub {
+                        0 => {
+                            let rest = parts[5..].join(".");
+                            Some(format!("decoder.blocks.{i}.snake.{rest}"))
+                        }
+                        1 => {
+                            let rest = parts[5..].join(".");
+                            Some(format!("decoder.blocks.{i}.up.conv.{rest}"))
+                        }
+                        2 | 3 | 4 => {
+                            let r = sub - 1; // res1/res2/res3
+                            if parts.len() < 7 || parts[5] != "block" {
+                                return None;
+                            }
+                            let inner: usize = parts[6].parse().ok()?;
+                            let rest = parts[7..].join(".");
+                            res_unit_inner(&format!("decoder.blocks.{i}.res{r}"), inner, &rest)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else if parts.first().copied() == Some("encoder") {
+        if parts.len() >= 3 && parts[1] == "block" {
+            let hf_idx: usize = parts[2].parse().ok()?;
+            if hf_idx == 0 {
+                let rest = parts[3..].join(".");
+                return Some(format!("encoder.first.conv.{rest}"));
+            }
+            let i = hf_idx.checked_sub(1)?;
+            if parts.len() < 5 || parts[3] != "block" {
+                return None;
+            }
+            let sub: usize = parts[4].parse().ok()?;
+            match sub {
+                0 | 1 | 2 => {
+                    let r = sub + 1; // res1/res2/res3
+                    if parts.len() < 7 || parts[5] != "block" {
+                        return None;
+                    }
+                    let inner: usize = parts[6].parse().ok()?;
+                    let rest = parts[7..].join(".");
+                    res_unit_inner(&format!("encoder.blocks.{i}.res{r}"), inner, &rest)
+                }
+                3 => {
+                    let rest = parts[5..].join(".");
+                    Some(format!("encoder.blocks.{i}.snake.{rest}"))
+                }
+                4 => {
+                    let rest = parts[5..].join(".");
+                    Some(format!("encoder.blocks.{i}.down.conv.{rest}"))
+                }
+                _ => None,
+            }
+        } else if parts.len() >= 2 && (parts[1] == "fc_mu" || parts[1] == "fc_logvar") {
+            let head = parts[1];
+            let rest = parts[2..].join(".");
+            Some(format!("encoder.{head}.conv.{rest}"))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Inner mapping for a `CausalResidualUnit.block` Sequential of
+/// `[Snake1d, Conv(k=7,dil), Snake1d, Conv(k=1)]`.
+fn res_unit_inner(prefix: &str, inner: usize, rest: &str) -> Option<String> {
+    match inner {
+        0 => Some(format!("{prefix}.snake1.{rest}")),
+        1 => Some(format!("{prefix}.conv1.conv.{rest}")),
+        2 => Some(format!("{prefix}.snake2.{rest}")),
+        3 => Some(format!("{prefix}.conv2.conv.{rest}")),
+        _ => None,
+    }
 }
 
 fn merge_apply_result(dst: &mut ApplyResult, src: ApplyResult) {
@@ -73,12 +201,13 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     path: &Path,
     prefix: Option<&str>,
+    remap: Option<fn(&str) -> Option<String>>,
 ) -> Result<ApplyResult> {
     // Read, materialize weight_norm, re-serialize, then hand to burn-store.
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let st = SafeTensors::deserialize(&mmap)?;
-    let synth_bytes = materialize_weight_norm(&st, prefix)?;
+    let synth_bytes = materialize_weight_norm(&st, prefix, remap)?;
     drop(st);
     drop(mmap);
 
@@ -98,7 +227,11 @@ fn map_store_err(e: SafetensorsStoreError) -> Error {
 /// other tensors are passed through unchanged. If `prefix` is provided, it
 /// is prepended to every key in the output. Returns a fresh serialized
 /// safetensors buffer.
-fn materialize_weight_norm(st: &SafeTensors<'_>, prefix: Option<&str>) -> Result<Vec<u8>> {
+fn materialize_weight_norm(
+    st: &SafeTensors<'_>,
+    prefix: Option<&str>,
+    remap: Option<fn(&str) -> Option<String>>,
+) -> Result<Vec<u8>> {
     use safetensors::serialize;
 
     let mut weight_g: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
@@ -120,16 +253,32 @@ fn materialize_weight_norm(st: &SafeTensors<'_>, prefix: Option<&str>) -> Result
         }
     }
 
-    let add_prefix = |s: &str| -> String {
-        match prefix {
-            Some(p) => format!("{p}{s}"),
-            None => s.to_string(),
-        }
+    // Translate `name` (bare HF key, no prefix) through the optional remap and
+    // then add the prefix. Returns `None` if the remap drops the key.
+    let translate = |name: &str| -> Option<String> {
+        let mapped: String = match remap {
+            Some(f) => f(name)?,
+            None => name.to_string(),
+        };
+        Some(match prefix {
+            Some(p) => format!("{p}{mapped}"),
+            None => mapped,
+        })
     };
 
     let mut out: HashMap<String, (Dtype, Vec<usize>, Vec<u8>)> = HashMap::new();
     for (name, shape, dtype, data) in plain {
-        out.insert(add_prefix(&name), (dtype, shape, data));
+        let Some(key) = translate(&name) else { continue };
+        // Upcast BF16/F16 → F32 since several burn backends (ndarray) don't
+        // support reduced-precision tensor data.
+        let (dtype, data) = match dtype {
+            Dtype::BF16 | Dtype::F16 => {
+                let v = decode_f32(dtype, &data)?;
+                (Dtype::F32, f32_to_le_bytes(&v))
+            }
+            other => (other, data),
+        };
+        out.insert(key, (dtype, shape, data));
     }
 
     for (stem, (v_shape, v_data)) in weight_v {
@@ -157,10 +306,9 @@ fn materialize_weight_norm(st: &SafeTensors<'_>, prefix: Option<&str>) -> Result
             }
         }
         let bytes = f32_to_le_bytes(&w);
-        out.insert(
-            add_prefix(&format!("{stem}.weight")),
-            (Dtype::F32, v_shape, bytes),
-        );
+        let bare = format!("{stem}.weight");
+        let Some(key) = translate(&bare) else { continue };
+        out.insert(key, (Dtype::F32, v_shape, bytes));
     }
 
     if !weight_g.is_empty() {
