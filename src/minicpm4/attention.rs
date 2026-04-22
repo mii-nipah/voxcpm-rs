@@ -163,7 +163,6 @@ impl<B: Backend> MiniCpmAttention<B> {
     ) -> Tensor<B, 4> {
         let [b, h, s_q, _d] = q.dims();
         let s_k = k.dims()[2];
-
         let scores = q.matmul(k.swap_dims(2, 3)).mul_scalar(self.scale);
 
         let scores = if is_causal {
