@@ -220,6 +220,37 @@ let opts = GenerateOptions::builder()
     .build();
 ```
 
+### Cancellation
+
+Long generations can be cancelled cooperatively from another thread via
+`CancelToken`. The autoregressive loop polls the token between every
+diffusion step, so cancel latency is bounded by one step
+(~200 ms on `wgpu` at default `timesteps=10`).
+
+```rust
+use std::{thread, time::Duration};
+use voxcpm_rs::{CancelToken, Error, GenerateOptions};
+
+let cancel = CancelToken::new();
+{
+    let cancel = cancel.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(5));
+        cancel.cancel(); // safe to call from any thread, idempotent
+    });
+}
+
+let opts = GenerateOptions::builder().cancel(cancel).build();
+match model.generate("a very long passage…", opts) {
+    Ok(wav) => { /* finished in time */ }
+    Err(Error::Cancelled) => { /* user / watchdog bailed */ }
+    Err(e) => return Err(e.into()),
+}
+```
+
+`CancelToken` is `Clone + Send + Sync` (an `Arc<AtomicBool>` underneath),
+so you can hand copies to as many watchers as you like.
+
 ## Architecture
 
 VoxCPM2 is a cascade of four components — each lives in its own module:

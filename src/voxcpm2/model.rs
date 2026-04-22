@@ -141,7 +141,8 @@ impl<B: Backend> VoxCpm2Model<B> {
         max_len: usize,
         inference_timesteps: usize,
         cfg_value: f64,
-    ) -> Tensor<B, 3> {
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> crate::Result<Tensor<B, 3>> {
         let device = feat.device();
         let [_b, _s, p, d] = feat.dims();
         let patch_size = self.patch_size();
@@ -223,6 +224,15 @@ impl<B: Backend> VoxCpm2Model<B> {
         };
 
         for i in 0..max_len {
+            // Cancellation check (cheap atomic load via callback). Bails
+            // before launching the next DiT sample so latency = at most
+            // one in-flight diffusion step (~200ms on wgpu).
+            if let Some(c) = cancel
+                && c()
+            {
+                return Err(crate::Error::Cancelled);
+            }
+
             // DiT inputs: concat(lm_to_dit(lm), res_to_dit(res))
             let dit1 = self.lm_to_dit_proj.forward(lm_hidden.clone()); // [B, dit_h]
             let dit2 = self.res_to_dit_proj.forward(residual_hidden.clone()); // [B, dit_h]
@@ -339,7 +349,7 @@ impl<B: Backend> VoxCpm2Model<B> {
         debug_assert_eq!(p2, p);
         debug_assert_eq!(d2, d);
         // Permute [B,T,P,D] -> [B,D,T,P] via swap(1,3) then swap(2,3).
-        feats.swap_dims(1, 3).swap_dims(2, 3).reshape([b, d, t * p])
+        Ok(feats.swap_dims(1, 3).swap_dims(2, 3).reshape([b, d, t * p]))
     }
 }
 

@@ -46,6 +46,10 @@ pub enum Error {
     #[error("Unsupported: {0}")]
     Unsupported(String),
 
+    /// Generation was cancelled via [`crate::CancelToken`].
+    #[error("generation cancelled")]
+    Cancelled,
+
     #[error("{0}")]
     Other(String),
 }

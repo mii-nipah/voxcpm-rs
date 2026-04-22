@@ -9,6 +9,60 @@ use crate::VoxCpm2Config;
 use burn::prelude::*;
 use burn::tensor::{Int, TensorData};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Cooperative cancellation handle for [`VoxCPM::generate`].
+///
+/// Cheap to clone (`Arc<AtomicBool>` underneath). Signal cancellation from
+/// any thread by calling [`CancelToken::cancel`]; the in-flight `generate`
+/// call will check between autoregressive steps and bail with
+/// [`crate::Error::Cancelled`]. Cancel latency is bounded by one diffusion
+/// step (~200 ms on `wgpu` at default `timesteps=10`).
+///
+/// ```no_run
+/// use std::thread;
+/// use voxcpm_rs::{CancelToken, GenerateOptions, Prompt, VoxCPM};
+/// # type B = burn::backend::NdArray<f32>;
+/// # let model: VoxCPM<B> = unimplemented!();
+/// let cancel = CancelToken::new();
+///
+/// // Cancel from a watchdog thread after 2 s.
+/// {
+///     let cancel = cancel.clone();
+///     thread::spawn(move || {
+///         thread::sleep(std::time::Duration::from_secs(2));
+///         cancel.cancel();
+///     });
+/// }
+///
+/// let opts = GenerateOptions::builder().cancel(cancel).build();
+/// match model.generate("a very long text...", opts) {
+///     Ok(wav) => { /* completed */ }
+///     Err(voxcpm_rs::Error::Cancelled) => { /* user cancelled */ }
+///     Err(e) => return Err(e.into()),
+/// }
+/// # Ok::<_, Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// Create a new, un-cancelled token.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Signal cancellation. Idempotent; safe to call from any thread.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 /// Source of prompt audio for [`Prompt::Reference`], [`Prompt::Continuation`]
 /// and [`Prompt::Combined`].
@@ -105,6 +159,10 @@ pub struct GenerateOptions {
     pub max_len: usize,
     /// Prompt-conditioning mode. See [`Prompt`].
     pub prompt: Prompt,
+    /// Optional [`CancelToken`] for cooperative cancellation. When `Some`,
+    /// the autoregressive loop checks the token between every step and
+    /// returns [`crate::Error::Cancelled`] if it has been signalled.
+    pub cancel: Option<CancelToken>,
 }
 
 impl Default for GenerateOptions {
@@ -115,6 +173,7 @@ impl Default for GenerateOptions {
             min_len: 2,
             max_len: 2000,
             prompt: Prompt::None,
+            cancel: None,
         }
     }
 }
@@ -127,7 +186,7 @@ impl GenerateOptions {
     /// let opts = GenerateOptions::builder()
     ///     .timesteps(8)
     ///     .cfg(2.0)
-    ///     .prompt(Prompt::Reference { wav: "speaker.wav".into() })
+    ///     .prompt(Prompt::Reference { audio: "speaker.wav".into() })
     ///     .build();
     /// ```
     pub fn builder() -> GenerateOptionsBuilder {
@@ -166,6 +225,11 @@ impl GenerateOptionsBuilder {
     /// Set [`GenerateOptions::prompt`].
     pub fn prompt(mut self, p: Prompt) -> Self {
         self.inner.prompt = p;
+        self
+    }
+    /// Set [`GenerateOptions::cancel`].
+    pub fn cancel(mut self, token: CancelToken) -> Self {
+        self.inner.cancel = Some(token);
         self
     }
     /// Finalize into a [`GenerateOptions`].
@@ -417,6 +481,15 @@ impl<B: Backend> VoxCPM<B> {
         let feat_t: Tensor<B, 4> = feat_seq.unsqueeze_dim(0); // [1, S, P, D]
 
         // 4) Run the main inference loop: latent patches → [B, D, T*P].
+        // Wrap the cancel token (if any) into a `dyn Fn() -> bool` so the
+        // model layer doesn't need to know about `CancelToken` directly.
+        let cancel_fn: Option<Box<dyn Fn() -> bool>> = opts
+            .cancel
+            .as_ref()
+            .map(|c| {
+                let c = c.clone();
+                Box::new(move || c.is_cancelled()) as Box<dyn Fn() -> bool>
+            });
         let latent = self.model.inference(
             text_token_t,
             text_mask_t,
@@ -426,7 +499,8 @@ impl<B: Backend> VoxCPM<B> {
             opts.max_len,
             opts.inference_timesteps,
             opts.cfg_value as f64,
-        );
+            cancel_fn.as_deref(),
+        )?;
 
         // 5) VAE decode → waveform [B, 1, T_out].
         let wav = self.model.audio_vae.decode(latent);

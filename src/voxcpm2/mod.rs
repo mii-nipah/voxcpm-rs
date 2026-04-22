@@ -4,4 +4,4 @@ pub mod model;
 pub mod wrapper;
 
 pub use model::VoxCpm2Model;
-pub use wrapper::{GenerateOptions, GenerateOptionsBuilder, Prompt, PromptAudio, VoxCPM};
+pub use wrapper::{CancelToken, GenerateOptions, GenerateOptionsBuilder, Prompt, PromptAudio, VoxCPM};

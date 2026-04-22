@@ -54,4 +54,4 @@ pub use config::{
     VoxCpmDitConfig, VoxCpmEncoderConfig,
 };
 pub use error::{Error, Result};
-pub use voxcpm2::{GenerateOptions, GenerateOptionsBuilder, Prompt, PromptAudio, VoxCPM};
+pub use voxcpm2::{CancelToken, GenerateOptions, GenerateOptionsBuilder, Prompt, PromptAudio, VoxCPM};

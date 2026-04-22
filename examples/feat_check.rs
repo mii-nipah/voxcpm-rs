@@ -23,7 +23,9 @@ fn main() {
     let d = model.latent_dim();
     let feat: Tensor<B, 4> = Tensor::zeros([1, s, p, d], &device);
 
-    let latent = model.inference(text_token, text_mask, feat, feat_mask, 5, 20, 10, 2.0);
+    let latent = model
+        .inference(text_token, text_mask, feat, feat_mask, 5, 20, 10, 2.0, None)
+        .expect("inference");
     let dims = latent.dims();
     eprintln!("latent shape: {:?}", dims);
     let data = latent.into_data();
