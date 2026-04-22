@@ -13,19 +13,43 @@ use crate::{Error, Result};
 
 /// Write a 32-bit float mono waveform to a 16-bit PCM WAV file.
 pub fn write_wav(path: impl AsRef<Path>, samples: &[f32], sample_rate: u32) -> Result<()> {
+    let file = std::fs::File::create(path)?;
+    write_wav_to(std::io::BufWriter::new(file), samples, sample_rate)
+}
+
+/// Write a 32-bit float mono waveform as 16-bit PCM WAV to any
+/// `Write + Seek` sink (e.g. `Cursor<Vec<u8>>`, `BufWriter<File>`,
+/// or a memory-mapped buffer). Mirrors [`write_wav`] but lets callers
+/// stream the encoded bytes anywhere — useful for HTTP responses,
+/// channels, sockets, or in-memory pipelines that don't want to touch
+/// the filesystem.
+pub fn write_wav_to<W: std::io::Write + std::io::Seek>(
+    writer: W,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(path, spec)?;
+    let mut writer = hound::WavWriter::new(writer, spec)?;
     for &s in samples {
         let clamped = s.clamp(-1.0, 1.0);
         writer.write_sample((clamped * i16::MAX as f32) as i16)?;
     }
     writer.finalize()?;
     Ok(())
+}
+
+/// Encode a 32-bit float mono waveform as a 16-bit PCM WAV byte buffer.
+/// Convenience wrapper over [`write_wav_to`] for the common
+/// "give me the bytes" case (HTTP responses, channels, etc.).
+pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+    let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+    write_wav_to(&mut buf, samples, sample_rate)?;
+    Ok(buf.into_inner())
 }
 
 /// Decode an audio file (WAV/FLAC/MP3/etc. — anything Symphonia supports) to

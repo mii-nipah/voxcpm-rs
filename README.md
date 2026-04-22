@@ -92,8 +92,13 @@ exposing a small, idiomatic Rust API.
    ```
 
    `VoxCPM::generate` takes `&self`, so one loaded model can serve any number
-   of synthesis calls — wrap it in an `Arc<VoxCPM<B>>` to share across threads
-   or request handlers.
+   of **sequential** synthesis calls without reloading. Note however that
+   `VoxCPM<B>` is **not `Sync`** — burn's `Param<Tensor<...>>` wraps a
+   `std::cell::OnceCell` for lazy device materialization, which transitively
+   makes the whole model `!Sync`. To share a single loaded model across
+   threads or async tasks, wrap it in `Arc<Mutex<VoxCPM<B>>>` (or
+   `Arc<parking_lot::Mutex<...>>`) and serialize `generate` calls; for true
+   parallel inference, load one `VoxCPM<B>` per worker.
 
 4. **Or just run the bundled example:**
 
