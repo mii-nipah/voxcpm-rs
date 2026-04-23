@@ -163,6 +163,13 @@ pub struct GenerateOptions {
     /// the autoregressive loop checks the token between every step and
     /// returns [`crate::Error::Cancelled`] if it has been signalled.
     pub cancel: Option<CancelToken>,
+    /// Streaming-only: number of latent patches to accumulate per emitted
+    /// audio chunk in [`VoxCPM::generate_stream`]. Smaller = lower
+    /// per-chunk latency but more redundant VAE-decode work; larger = fewer
+    /// chunks, more samples per chunk. Ignored by the non-streaming
+    /// [`VoxCPM::generate`] path. Default: `5` (~400 ms / chunk @ default
+    /// model config).
+    pub chunk_patches: usize,
 }
 
 impl Default for GenerateOptions {
@@ -174,6 +181,7 @@ impl Default for GenerateOptions {
             max_len: 2000,
             prompt: Prompt::None,
             cancel: None,
+            chunk_patches: 5,
         }
     }
 }
@@ -230,6 +238,12 @@ impl GenerateOptionsBuilder {
     /// Set [`GenerateOptions::cancel`].
     pub fn cancel(mut self, token: CancelToken) -> Self {
         self.inner.cancel = Some(token);
+        self
+    }
+    /// Set [`GenerateOptions::chunk_patches`] (only used by
+    /// [`VoxCPM::generate_stream`]).
+    pub fn chunk_patches(mut self, n: usize) -> Self {
+        self.inner.chunk_patches = n;
         self
     }
     /// Finalize into a [`GenerateOptions`].
@@ -385,9 +399,109 @@ impl<B: Backend> VoxCPM<B> {
     /// - [`Prompt::Combined`] — both a reference prefix and a continuation
     ///   suffix.
     pub fn generate(&self, text: &str, opts: GenerateOptions) -> crate::Result<Vec<f32>> {
+        let inputs = self.build_inference_inputs(text, &opts.prompt)?;
+
+        // Wrap the cancel token (if any) into a `dyn Fn() -> bool` so the
+        // model layer doesn't need to know about `CancelToken` directly.
+        let cancel_fn: Option<Box<dyn Fn() -> bool>> = opts.cancel.as_ref().map(|c| {
+            let c = c.clone();
+            Box::new(move || c.is_cancelled()) as Box<dyn Fn() -> bool>
+        });
+        let latent = self.model.inference(
+            inputs.text_token,
+            inputs.text_mask,
+            inputs.feat,
+            inputs.feat_mask,
+            opts.min_len,
+            opts.max_len,
+            opts.inference_timesteps,
+            opts.cfg_value as f64,
+            cancel_fn.as_deref(),
+        )?;
+
+        Ok(decode_latent_to_samples(&self.model.audio_vae, latent)?)
+    }
+
+    /// Streaming variant of [`Self::generate`]: returns an iterator that
+    /// yields chunks of mono `f32` audio samples (at [`Self::sample_rate`])
+    /// as they become available, instead of returning the entire waveform
+    /// at once.
+    ///
+    /// Each call to [`Iterator::next`] runs up to
+    /// [`GenerateOptions::chunk_patches`] autoregressive steps, then decodes
+    /// the accumulated latent through the AudioVAE and yields only the new
+    /// audio samples since the previous chunk. Audio is bit-identical to
+    /// what [`Self::generate`] would produce — chunk boundaries are
+    /// seamless because the AudioVAE decoder is causal.
+    ///
+    /// The iterator stops when the model emits a stop token (or `max_len`
+    /// is hit). [`crate::Error::Cancelled`] is yielded if the
+    /// [`CancelToken`] is signalled mid-generation.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use voxcpm_rs::{GenerateOptions, VoxCPM};
+    /// # type B = burn::backend::NdArray<f32>;
+    /// # let model: VoxCPM<B> = unimplemented!();
+    /// let opts = GenerateOptions::builder().chunk_patches(5).build();
+    /// let mut all = Vec::<f32>::new();
+    /// for chunk in model.generate_stream("Hello, world!", opts)? {
+    ///     let chunk = chunk?;
+    ///     // play / send / write `chunk` here as soon as it arrives
+    ///     all.extend_from_slice(&chunk);
+    /// }
+    /// # Ok::<_, voxcpm_rs::Error>(())
+    /// ```
+    ///
+    /// # Latency vs. throughput
+    ///
+    /// Smaller [`GenerateOptions::chunk_patches`] → lower per-chunk latency
+    /// but more redundant VAE-decode work (each chunk re-decodes the full
+    /// accumulated latent). The default `5` is a sensible balance for
+    /// real-time playback (~400 ms / chunk @ default model config). Setting
+    /// it to `1` minimises latency at the cost of `O(N²)` decode work
+    /// across the whole utterance.
+    pub fn generate_stream(
+        &self,
+        text: &str,
+        opts: GenerateOptions,
+    ) -> crate::Result<GenerateStream<'_, B>> {
+        let inputs = self.build_inference_inputs(text, &opts.prompt)?;
+        let state = self.model.prefill(
+            inputs.text_token,
+            inputs.text_mask,
+            inputs.feat,
+            inputs.feat_mask,
+            opts.max_len,
+        );
+        Ok(GenerateStream {
+            model: &self.model,
+            state,
+            pred_feats: Vec::new(),
+            samples_emitted: 0,
+            step: 0,
+            min_len: opts.min_len,
+            max_len: opts.max_len,
+            inference_timesteps: opts.inference_timesteps,
+            cfg_value: opts.cfg_value as f64,
+            chunk_patches: opts.chunk_patches.max(1),
+            cancel: opts.cancel,
+            finished: false,
+        })
+    }
+
+    /// Shared between [`Self::generate`] and [`Self::generate_stream`]:
+    /// tokenize text, encode optional prompt audios, and assemble the
+    /// `[1, S, P, D]` feat tensor with its text/feat masks.
+    fn build_inference_inputs(
+        &self,
+        text: &str,
+        prompt: &Prompt,
+    ) -> crate::Result<InferenceInputs<B>> {
         // Decompose the prompt into the (optional) reference + continuation
         // pieces the sequence builder consumes.
-        let (ref_audio, prompt_audio, prompt_text) = match &opts.prompt {
+        let (ref_audio, prompt_audio, prompt_text) = match prompt {
             Prompt::None => (None, None, None),
             Prompt::Reference { audio } => (Some(audio), None, None),
             Prompt::Continuation { audio, text } => (None, Some(audio), Some(text.as_str())),
@@ -472,48 +586,163 @@ impl<B: Backend> VoxCPM<B> {
         } else {
             Tensor::cat(feat_chunks, 0)
         };
-        let text_token_t: Tensor<B, 2, Int> =
+        let text_token: Tensor<B, 2, Int> =
             Tensor::from_data(TensorData::new(tokens, [1, s]), device);
-        let text_mask_t: Tensor<B, 2> =
+        let text_mask: Tensor<B, 2> =
             Tensor::from_data(TensorData::new(t_mask, [1, s]), device);
-        let feat_mask_t: Tensor<B, 2> =
+        let feat_mask: Tensor<B, 2> =
             Tensor::from_data(TensorData::new(f_mask, [1, s]), device);
-        let feat_t: Tensor<B, 4> = feat_seq.unsqueeze_dim(0); // [1, S, P, D]
+        let feat: Tensor<B, 4> = feat_seq.unsqueeze_dim(0); // [1, S, P, D]
 
-        // 4) Run the main inference loop: latent patches → [B, D, T*P].
-        // Wrap the cancel token (if any) into a `dyn Fn() -> bool` so the
-        // model layer doesn't need to know about `CancelToken` directly.
-        let cancel_fn: Option<Box<dyn Fn() -> bool>> = opts
-            .cancel
-            .as_ref()
-            .map(|c| {
-                let c = c.clone();
-                Box::new(move || c.is_cancelled()) as Box<dyn Fn() -> bool>
-            });
-        let latent = self.model.inference(
-            text_token_t,
-            text_mask_t,
-            feat_t,
-            feat_mask_t,
-            opts.min_len,
-            opts.max_len,
-            opts.inference_timesteps,
-            opts.cfg_value as f64,
-            cancel_fn.as_deref(),
-        )?;
+        Ok(InferenceInputs {
+            text_token,
+            text_mask,
+            feat,
+            feat_mask,
+        })
+    }
+}
 
-        // 5) VAE decode → waveform [B, 1, T_out].
-        let wav = self.model.audio_vae.decode(latent);
-        let wav = wav.squeeze_dim::<2>(1); // [B, T_out]
-        let wav = wav.squeeze_dim::<1>(0); // [T_out]
-        let data = wav.into_data();
-        // Backend-agnostic: VAE may produce f32, f16 or bf16 depending on
-        // the active Backend; convert to f32 for output regardless.
-        let samples: Vec<f32> = data
-            .convert::<f32>()
-            .into_vec::<f32>()
-            .map_err(|_| crate::Error::Other("unexpected VAE output dtype".into()))?;
-        Ok(samples)
+/// Output of [`VoxCPM::build_inference_inputs`].
+struct InferenceInputs<B: Backend> {
+    text_token: Tensor<B, 2, Int>,
+    text_mask: Tensor<B, 2>,
+    feat: Tensor<B, 4>,
+    feat_mask: Tensor<B, 2>,
+}
+
+/// Run AudioVAE decode on a stacked latent and pull the result back as `f32`
+/// PCM. Shared between [`VoxCPM::generate`] and [`GenerateStream`].
+fn decode_latent_to_samples<B: Backend>(
+    audio_vae: &crate::audiovae::AudioVae<B>,
+    latent: Tensor<B, 3>,
+) -> crate::Result<Vec<f32>> {
+    let wav = audio_vae.decode(latent);
+    let wav = wav.squeeze_dim::<2>(1); // [B, T_out]
+    let wav = wav.squeeze_dim::<1>(0); // [T_out]
+    let data = wav.into_data();
+    // Backend-agnostic: VAE may produce f32, f16 or bf16 depending on the
+    // active Backend; convert to f32 for output regardless.
+    data.convert::<f32>()
+        .into_vec::<f32>()
+        .map_err(|_| crate::Error::Other("unexpected VAE output dtype".into()))
+}
+
+/// Iterator returned by [`VoxCPM::generate_stream`]. Yields `Result<Vec<f32>>`
+/// chunks of mono PCM at [`VoxCPM::sample_rate`] until generation stops.
+///
+/// Borrows the underlying [`crate::voxcpm2::VoxCpm2Model`] for its lifetime;
+/// to send a stream across threads, collect the chunks in the producing
+/// thread and forward them through a channel.
+#[derive(Debug)]
+pub struct GenerateStream<'a, B: Backend> {
+    model: &'a crate::voxcpm2::VoxCpm2Model<B>,
+    state: crate::voxcpm2::model::InferenceState<B>,
+    pred_feats: Vec<Tensor<B, 4>>,
+    samples_emitted: usize,
+    step: usize,
+    min_len: usize,
+    max_len: usize,
+    inference_timesteps: usize,
+    cfg_value: f64,
+    chunk_patches: usize,
+    cancel: Option<CancelToken>,
+    finished: bool,
+}
+
+impl<B: Backend> GenerateStream<'_, B> {
+    /// Sample rate (Hz) of the chunks this stream yields. Always equal to
+    /// the producing [`VoxCPM::sample_rate`].
+    pub fn sample_rate(&self) -> u32 {
+        self.model.sample_rate() as u32
+    }
+
+    /// Number of autoregressive steps consumed so far. One step ≈ one
+    /// latent patch ≈ ~80 ms of audio at the default model config.
+    pub fn steps_taken(&self) -> usize {
+        self.state.steps_taken
+    }
+
+    /// Drive the stream forward up to `chunk_patches` AR steps and either
+    /// return `Some(chunk)` of new samples, or `None` when generation is
+    /// complete. Errors are returned via the `Result`.
+    fn step_chunk(&mut self) -> crate::Result<Option<Vec<f32>>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        let mut produced_any = false;
+        for _ in 0..self.chunk_patches {
+            if self.step >= self.max_len {
+                self.finished = true;
+                break;
+            }
+            if let Some(c) = &self.cancel
+                && c.is_cancelled()
+            {
+                self.finished = true;
+                return Err(crate::Error::Cancelled);
+            }
+
+            // `i` matches the loop index from `VoxCpm2Model::inference`: the
+            // 0-based index of the patch we're about to produce. The stop
+            // head is only honored once `i > min_len` (mirroring the
+            // non-streaming path so the streamed audio is bit-identical).
+            let i = self.step;
+            let crate::voxcpm2::model::DitStep { pred_feat, stop } =
+                self.model.dit_step(&mut self.state, self.inference_timesteps, self.cfg_value);
+            self.pred_feats.push(pred_feat.clone());
+            produced_any = true;
+
+            if i > self.min_len && stop {
+                self.finished = true;
+                self.step += 1;
+                break;
+            }
+            self.model.lm_step(&mut self.state, pred_feat);
+            self.step += 1;
+        }
+
+        if !produced_any {
+            return Ok(None);
+        }
+
+        // Decode the cumulative latent and emit only the new tail samples.
+        // The AudioVAE decoder is causal, so re-decoding a longer prefix
+        // produces bit-identical samples for the already-emitted portion —
+        // this gives us seamless chunks without porting Python's stateful
+        // StreamingVAEDecoder.
+        let latent = crate::voxcpm2::VoxCpm2Model::stack_pred_feats(&self.pred_feats);
+        let all = decode_latent_to_samples(&self.model.audio_vae, latent)?;
+        if all.len() <= self.samples_emitted {
+            // No new samples this round (shouldn't happen, but be safe).
+            return Ok(Some(Vec::new()));
+        }
+        let chunk = all[self.samples_emitted..].to_vec();
+        self.samples_emitted = all.len();
+        Ok(Some(chunk))
+    }
+}
+
+impl<B: Backend> Iterator for GenerateStream<'_, B> {
+    type Item = crate::Result<Vec<f32>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.step_chunk() {
+                Ok(Some(chunk)) if chunk.is_empty() => {
+                    // Avoid yielding empty chunks; either keep stepping or
+                    // finish.
+                    if self.finished {
+                        return None;
+                    }
+                    continue;
+                }
+                Ok(Some(chunk)) => return Some(Ok(chunk)),
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
 }
 

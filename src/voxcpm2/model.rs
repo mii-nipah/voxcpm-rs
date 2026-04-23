@@ -119,33 +119,22 @@ impl<B: Backend> VoxCpm2Model<B> {
         }
     }
 
-    /// Core inference loop.
+    /// Run text + prompt-feat prefill through the base + residual LMs and
+    /// build the per-call autoregressive state used by [`Self::dit_step`] /
+    /// [`Self::lm_step`].
     ///
-    /// Runs the text+audio-mask prefill through the base LM and residual LM,
-    /// then iteratively samples audio feature patches via the diffusion
-    /// decoder until the stop head fires (or `max_len` is reached).
-    ///
-    /// * `text_token`: `[B=1, S]` int tokens.
-    /// * `text_mask`, `feat_mask`: `[1, S]` float masks (0/1) indicating which
-    ///   positions are text and which are audio patches.
-    /// * `feat`: `[1, S, P, D]` audio latent patches (zeros at text positions).
-    ///
-    /// Returns `[B=1, D, T*P]` — the concatenated latent feature sequence.
-    pub fn inference(
+    /// `max_len` sizes the static KV caches so they cover the prefill plus
+    /// up to `max_len` AR steps.
+    pub fn prefill(
         &self,
         text_token: Tensor<B, 2, burn::tensor::Int>,
         text_mask: Tensor<B, 2>,
         feat: Tensor<B, 4>,
         feat_mask: Tensor<B, 2>,
-        min_len: usize,
         max_len: usize,
-        inference_timesteps: usize,
-        cfg_value: f64,
-        cancel: Option<&dyn Fn() -> bool>,
-    ) -> crate::Result<Tensor<B, 3>> {
+    ) -> InferenceState<B> {
         let device = feat.device();
-        let [_b, _s, p, d] = feat.dims();
-        let patch_size = self.patch_size();
+        let [_b, _s, _p, _d] = feat.dims();
 
         // 1) Encode audio feature patches.
         let feat_embed = self.feat_encoder.forward(feat.clone()); // [B, S, enc_h]
@@ -202,23 +191,134 @@ impl<B: Backend> VoxCpm2Model<B> {
         res_cache.fill(residual_kv);
 
         // Take the last position for autoregressive start.
-        let mut lm_hidden: Tensor<B, 2> =
+        let lm_hidden: Tensor<B, 2> =
             lm_hidden_prefill.narrow(1, s_ctx - 1, 1).squeeze_dim::<2>(1);
-        let mut residual_hidden: Tensor<B, 2> =
+        let residual_hidden: Tensor<B, 2> =
             residual_outputs.narrow(1, s_ctx - 1, 1).squeeze_dim::<2>(1);
 
-        let mut prefix_feat_cond = prefix_feat;
+        InferenceState {
+            lm_hidden,
+            residual_hidden,
+            prefix_feat_cond: prefix_feat,
+            base_cache,
+            res_cache,
+            steps_taken: 0,
+        }
+    }
+
+    /// Run one diffusion sample + stop-head check from the current state.
+    ///
+    /// Updates `state.prefix_feat_cond` to the newly predicted patch (so the
+    /// next DiT step sees it as context) but does NOT advance the LM caches —
+    /// call [`Self::lm_step`] with the returned `pred_feat` to do that before
+    /// the next [`Self::dit_step`].
+    pub fn dit_step(
+        &self,
+        state: &mut InferenceState<B>,
+        inference_timesteps: usize,
+        cfg_value: f64,
+    ) -> DitStep<B> {
+        let patch_size = self.patch_size();
+
+        // DiT inputs: concat(lm_to_dit(lm), res_to_dit(res))
+        let dit1 = self.lm_to_dit_proj.forward(state.lm_hidden.clone());
+        let dit2 = self.res_to_dit_proj.forward(state.residual_hidden.clone());
+        let dit_hidden = Tensor::cat(vec![dit1, dit2], 1); // [B, 2*dit_h]
+
+        // Diffusion sample: [B, D, P] -> [B, P, D]
+        let pred = self.feat_decoder.forward(
+            dit_hidden,
+            inference_timesteps,
+            patch_size,
+            state.prefix_feat_cond.clone().swap_dims(1, 2),
+            1.0,
+            cfg_value,
+            1.0,
+            true,
+        );
+        let pred_feat = pred.swap_dims(1, 2);
+        let pred4: Tensor<B, 4> = pred_feat.clone().unsqueeze_dim(1);
+        state.prefix_feat_cond = pred_feat;
+
+        // Stop check (cheap GPU→CPU sync via argmax).
+        let stop_logits = self
+            .stop_head
+            .forward(burn::tensor::activation::silu(self.stop_proj.forward(state.lm_hidden.clone())));
+        let stop = stop_logits
+            .argmax(1)
+            .into_data()
+            .iter::<i64>()
+            .next()
+            .unwrap_or(0)
+            == 1;
+
+        DitStep { pred_feat: pred4, stop }
+    }
+
+    /// Advance the base + residual LMs by one position using `pred_feat`
+    /// (`[1, 1, P, D]`, the patch returned by [`Self::dit_step`]). Caller
+    /// should only call this if it intends to take another DiT step.
+    pub fn lm_step(&self, state: &mut InferenceState<B>, pred_feat: Tensor<B, 4>) {
+        let curr_embed = self.feat_encoder.forward(pred_feat); // [B, 1, enc_h]
+        let curr_embed = self.enc_to_lm_proj.forward(curr_embed); // [B, 1, lm_h]
+        let curr_embed2: Tensor<B, 2> = curr_embed.squeeze_dim::<2>(1); // [B, lm_h]
+
+        let pos = state.base_cache.step();
+        let mut lm_hidden = self.base_lm.forward_step(curr_embed2.clone(), pos, &mut state.base_cache);
+        lm_hidden = self.fsq_layer.forward(lm_hidden);
+
+        let res_input2 = self
+            .fusion_concat_proj
+            .forward(Tensor::cat(vec![lm_hidden.clone(), curr_embed2], 1));
+        let pos = state.res_cache.step();
+        let residual_hidden = self.residual_lm.forward_step(res_input2, pos, &mut state.res_cache);
+
+        state.lm_hidden = lm_hidden;
+        state.residual_hidden = residual_hidden;
+        state.steps_taken += 1;
+    }
+
+    /// Stack a sequence of predicted latent patches `[1, 1, P, D]` into the
+    /// AudioVAE input shape `[1, D, T*P]`.
+    pub fn stack_pred_feats(pred_feats: &[Tensor<B, 4>]) -> Tensor<B, 3> {
+        let feats = Tensor::cat(pred_feats.to_vec(), 1);
+        let [b, t, p, d] = feats.dims();
+        feats.swap_dims(1, 3).swap_dims(2, 3).reshape([b, d, t * p])
+    }
+
+    /// Core inference loop.
+    ///
+    /// Runs the text+audio-mask prefill through the base LM and residual LM,
+    /// then iteratively samples audio feature patches via the diffusion
+    /// decoder until the stop head fires (or `max_len` is reached).
+    ///
+    /// * `text_token`: `[B=1, S]` int tokens.
+    /// * `text_mask`, `feat_mask`: `[1, S]` float masks (0/1) indicating which
+    ///   positions are text and which are audio patches.
+    /// * `feat`: `[1, S, P, D]` audio latent patches (zeros at text positions).
+    ///
+    /// Returns `[B=1, D, T*P]` — the concatenated latent feature sequence.
+    pub fn inference(
+        &self,
+        text_token: Tensor<B, 2, burn::tensor::Int>,
+        text_mask: Tensor<B, 2>,
+        feat: Tensor<B, 4>,
+        feat_mask: Tensor<B, 2>,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> crate::Result<Tensor<B, 3>> {
+        let mut state = self.prefill(text_token, text_mask, feat, feat_mask, max_len);
         let mut pred_feats: Vec<Tensor<B, 4>> = Vec::new();
 
         let profile = std::env::var("VOXCPM_PROFILE").is_ok();
         let mut t_dit_ns: u128 = 0;
-        let mut t_stop_ns: u128 = 0;
         let mut t_lm_ns: u128 = 0;
         let mut n_steps: usize = 0;
 
         // Helper closure: force a GPU→CPU sync by reading a tiny scalar.
-        // Only used under VOXCPM_PROFILE to turn async kernel dispatch into
-        // real per-phase wall-clock measurements.
         let sync_barrier = |t: Tensor<B, 2>| {
             let _ = t.slice([0..1, 0..1]).into_data();
         };
@@ -233,99 +333,30 @@ impl<B: Backend> VoxCpm2Model<B> {
                 return Err(crate::Error::Cancelled);
             }
 
-            // DiT inputs: concat(lm_to_dit(lm), res_to_dit(res))
-            let dit1 = self.lm_to_dit_proj.forward(lm_hidden.clone()); // [B, dit_h]
-            let dit2 = self.res_to_dit_proj.forward(residual_hidden.clone()); // [B, dit_h]
-            let dit_hidden = Tensor::cat(vec![dit1, dit2], 1); // [B, 2*dit_h]
-
             let t0 = profile.then(std::time::Instant::now);
-
-            // Diffusion sample: [B, D, P]
-            let pred = self.feat_decoder.forward(
-                dit_hidden,
-                inference_timesteps,
-                patch_size,
-                prefix_feat_cond.clone().swap_dims(1, 2),
-                1.0,
-                cfg_value,
-                1.0,
-                true,
-            );
-            // -> [B, P, D]
-            let pred_feat = pred.swap_dims(1, 2);
-
-            // Re-encode pred_feat through feat_encoder: need shape [B, 1, P, D]
-            let pred4: Tensor<B, 4> = pred_feat.clone().unsqueeze_dim(1);
-            pred_feats.push(pred4.clone());
-            prefix_feat_cond = pred_feat.clone();
-
-            // Profile barrier: force GPU sync so `t_dit_ns` measures real
-            // DiT wall-clock time and not just CPU-side kernel enqueue.
+            let DitStep { pred_feat, stop } =
+                self.dit_step(&mut state, inference_timesteps, cfg_value);
+            pred_feats.push(pred_feat.clone());
             if profile {
-                sync_barrier(pred_feat.clone().narrow(2, 0, 1).squeeze_dim(2));
+                sync_barrier(pred_feat.clone().squeeze_dim::<3>(1).narrow(2, 0, 1).squeeze_dim(2));
             }
             let t1 = profile.then(std::time::Instant::now);
 
-            // Stop check.
-            let stop_logits = self
-                .stop_head
-                .forward(burn::tensor::activation::silu(self.stop_proj.forward(lm_hidden.clone()))); // [B, 2]
-            let stop_arg = stop_logits.clone().argmax(1);
-            // Backend-agnostic int read: argmax tensor's elem type may be i32 (wgpu)
-            // or i64 (ndarray). `into_data()` yields a TensorData; use `iter::<i64>()`
-            // which converts whatever the underlying dtype is.
-            //
-            // NOTE: `into_data()` is itself a GPU→CPU sync; for profile we
-            // measure the interval around it as the stop-check cost.
-            let stop: i64 = stop_arg
-                .into_data()
-                .iter::<i64>()
-                .next()
-                .unwrap_or(0);
-            let t2 = profile.then(std::time::Instant::now);
-            if std::env::var("VOXCPM_DEBUG_STOP").is_ok() {
-                // Dtype-agnostic: convert whatever the backend emits to f32.
-                let d = stop_logits.into_data().convert::<f32>();
-                let sl = d.as_slice::<f32>().unwrap_or(&[]);
-                let lh = lm_hidden.clone().into_data().convert::<f32>();
-                let lhs = lh.as_slice::<f32>().unwrap_or(&[]);
-                let lh_abs_max = lhs.iter().fold(0f32, |a, &b| a.max(b.abs()));
-                let lh_first: Vec<f32> = lhs.iter().take(4).copied().collect();
-                eprintln!("step {i:4} stop={stop} logits=[{:.3}, {:.3}] lm_abs_max={:.3} lm[:4]={:?}", sl.first().copied().unwrap_or(0.0), sl.get(1).copied().unwrap_or(0.0), lh_abs_max, lh_first);
-            }
-            if i > min_len && stop == 1 {
-                if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+            if i > min_len && stop {
+                if let (Some(t0), Some(t1)) = (t0, t1) {
                     t_dit_ns += t1.duration_since(t0).as_nanos();
-                    t_stop_ns += t2.duration_since(t1).as_nanos();
                     n_steps += 1;
                 }
                 break;
             }
 
-            // Encode the single predicted patch.
-            let curr_embed = self.feat_encoder.forward(pred4); // [B, 1, enc_h]
-            let curr_embed = self.enc_to_lm_proj.forward(curr_embed); // [B, 1, lm_h]
-            let curr_embed2: Tensor<B, 2> = curr_embed.clone().squeeze_dim::<2>(1); // [B, lm_h]
+            self.lm_step(&mut state, pred_feat);
 
-            // Step base LM.
-            let pos = base_cache.step();
-            lm_hidden = self.base_lm.forward_step(curr_embed2.clone(), pos, &mut base_cache);
-            lm_hidden = self.fsq_layer.forward(lm_hidden);
-
-            // Step residual LM.
-            let res_input2 = self
-                .fusion_concat_proj
-                .forward(Tensor::cat(vec![lm_hidden.clone(), curr_embed2], 1));
-            let pos = res_cache.step();
-            residual_hidden = self.residual_lm.forward_step(res_input2, pos, &mut res_cache);
-
-            if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
-                // Force sync so `t_lm_ns` captures actual LM step wall time.
-                sync_barrier(residual_hidden.clone());
-                let t3 = std::time::Instant::now();
+            if let (Some(t0), Some(t1)) = (t0, t1) {
+                sync_barrier(state.residual_hidden.clone());
+                let t2 = std::time::Instant::now();
                 t_dit_ns += t1.duration_since(t0).as_nanos();
-                t_stop_ns += t2.duration_since(t1).as_nanos();
-                t_lm_ns += t3.duration_since(t2).as_nanos();
+                t_lm_ns += t2.duration_since(t1).as_nanos();
                 n_steps += 1;
             }
         }
@@ -333,23 +364,47 @@ impl<B: Backend> VoxCpm2Model<B> {
         if profile && n_steps > 0 {
             let ms = |ns: u128| (ns as f64) / 1e6;
             eprintln!(
-                "[profile] AR steps={} dit={:.1}ms stop_sync={:.1}ms lm_tail={:.1}ms avg_per_step: dit={:.2}ms stop={:.2}ms lm={:.2}ms",
-                n_steps, ms(t_dit_ns), ms(t_stop_ns), ms(t_lm_ns),
+                "[profile] AR steps={} dit+stop={:.1}ms lm_tail={:.1}ms avg_per_step: dit+stop={:.2}ms lm={:.2}ms",
+                n_steps, ms(t_dit_ns), ms(t_lm_ns),
                 ms(t_dit_ns) / n_steps as f64,
-                ms(t_stop_ns) / n_steps as f64,
                 ms(t_lm_ns) / n_steps as f64,
             );
         }
 
-        // Stack predictions [B, T, P, D] -> [B, D, T*P] (matches Python's
-        // einops `rearrange(..., "b t p d -> b d (t p)")`, where the flat
-        // index `k = t * P + p`).
-        let feats = Tensor::cat(pred_feats, 1);
-        let [b, t, p2, d2] = feats.dims();
-        debug_assert_eq!(p2, p);
-        debug_assert_eq!(d2, d);
-        // Permute [B,T,P,D] -> [B,D,T,P] via swap(1,3) then swap(2,3).
-        Ok(feats.swap_dims(1, 3).swap_dims(2, 3).reshape([b, d, t * p]))
+        Ok(Self::stack_pred_feats(&pred_feats))
     }
+}
+
+/// Per-call autoregressive state produced by [`VoxCpm2Model::prefill`] and
+/// consumed by [`VoxCpm2Model::dit_step`] / [`VoxCpm2Model::lm_step`].
+///
+/// You only need to touch this directly if you're driving inference manually
+/// (e.g. for streaming or custom early-exit logic). The high-level
+/// [`crate::VoxCPM::generate`] / [`crate::VoxCPM::generate_stream`] APIs
+/// manage it for you.
+#[derive(Debug)]
+pub struct InferenceState<B: Backend> {
+    /// `[1, lm_h]` — last hidden state of the base LM (input to DiT + stop).
+    pub lm_hidden: Tensor<B, 2>,
+    /// `[1, lm_h]` — last hidden state of the residual LM (input to DiT).
+    pub residual_hidden: Tensor<B, 2>,
+    /// `[1, P, D]` — last predicted patch, used as DiT prefix for the next step.
+    pub prefix_feat_cond: Tensor<B, 3>,
+    /// Static KV cache for the base LM. Sized for prefill + `max_len` steps.
+    pub base_cache: crate::minicpm4::StaticKvCache<B>,
+    /// Static KV cache for the residual LM.
+    pub res_cache: crate::minicpm4::StaticKvCache<B>,
+    /// Number of [`VoxCpm2Model::lm_step`] calls applied so far.
+    pub steps_taken: usize,
+}
+
+/// Output of [`VoxCpm2Model::dit_step`].
+#[derive(Debug)]
+pub struct DitStep<B: Backend> {
+    /// `[1, 1, P, D]` — the patch the diffusion sampler produced this step.
+    pub pred_feat: Tensor<B, 4>,
+    /// `true` if the stop head argmax fired this step. The caller decides
+    /// whether to honor it (e.g. ignore until `min_len` patches are out).
+    pub stop: bool,
 }
 

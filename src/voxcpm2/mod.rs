@@ -3,5 +3,8 @@
 pub mod model;
 pub mod wrapper;
 
-pub use model::VoxCpm2Model;
-pub use wrapper::{CancelToken, GenerateOptions, GenerateOptionsBuilder, Prompt, PromptAudio, VoxCPM};
+pub use model::{DitStep, InferenceState, VoxCpm2Model};
+pub use wrapper::{
+    CancelToken, GenerateOptions, GenerateOptionsBuilder, GenerateStream, Prompt, PromptAudio,
+    VoxCPM,
+};
