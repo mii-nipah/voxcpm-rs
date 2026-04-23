@@ -136,11 +136,17 @@ impl<B: Backend> UnifiedCfm<B> {
                     let pos_flat: Tensor<B, 2> = pos.clone().reshape([b, c * time_len]);
                     let neg_flat: Tensor<B, 2> = neg.clone().reshape([b, c * time_len]);
                     let dot = (pos_flat.clone() * neg_flat.clone()).sum_dim(1); // [B, 1]
-                    let sq = neg_flat.clone().powf_scalar(2.0).sum_dim(1).add_scalar(1e-8);
+                    let sq = (neg_flat.clone() * neg_flat.clone()).sum_dim(1).add_scalar(1e-8);
                     let st: Tensor<B, 2> = dot / sq;
                     let st: Tensor<B, 3> = st.unsqueeze_dim(2);
                     let st_b: Tensor<B, 3> = st.expand([b as i32, c as i32, time_len as i32]);
-                    neg.clone() * st_b.clone() + (pos - neg * st_b).mul_scalar(cfg_value)
+                    // Algebra: neg*st + (pos - neg*st)*cfg
+                    //        = neg*st*(1-cfg) + pos*cfg
+                    // Saves one elementwise kernel per step (1 mul, 1 sub avoided
+                    // in favour of a fused mul_scalar). At ~10 timesteps * ~25 AR
+                    // steps that's ~250 fewer kernel launches per generation.
+                    let scaled_st = st_b.mul_scalar(1.0 - cfg_value);
+                    neg * scaled_st + pos.mul_scalar(cfg_value)
                 } else {
                     neg.clone() + (pos - neg).mul_scalar(cfg_value)
                 }

@@ -34,8 +34,13 @@ impl<B: Backend> MiniCpmRmsNorm<B> {
     }
 
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        let variance = x.clone().powf_scalar(2.0).mean_dim(D - 1);
-        let x = x * variance.add_scalar(self.eps).powf_scalar(-0.5);
+        // RMS = mean(x*x) along last dim; rsqrt = 1/sqrt(...). Avoiding
+        // `powf_scalar(2.0)` / `powf_scalar(-0.5)` cuts two general-pow
+        // kernels per call (dominant in DiT decoder hot loop).
+        let x_sq = x.clone() * x.clone();
+        let variance = x_sq.mean_dim(D - 1);
+        let inv_rms = variance.add_scalar(self.eps).sqrt().recip();
+        let x = x * inv_rms;
         x * self.weight.val().unsqueeze()
     }
 }

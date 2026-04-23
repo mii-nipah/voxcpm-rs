@@ -24,7 +24,9 @@ voxcpm_rs::audio::write_wav("out.wav", &wav, model.sample_rate())?;
 - [API tour](#api-tour)
   - [Zero-shot synthesis](#zero-shot-synthesis)
   - [Voice cloning](#voice-cloning)
+  - [Streaming](#streaming)
   - [Tuning knobs](#tuning-knobs)
+  - [Cancellation](#cancellation)
 - [Architecture](#architecture)
 - [Examples](#examples)
 - [Contributing](#contributing)
@@ -212,6 +214,41 @@ Symmetrically, [`audio::load_audio_bytes`](src/audio.rs) /
 [`audio::load_audio_bytes_as`](src/audio.rs) let you decode encoded audio
 buffers without touching the filesystem.
 
+### Streaming
+
+For real-time playback, network streaming, or just to start hearing audio
+before the whole utterance is ready, use
+[`VoxCPM::generate_stream`](src/voxcpm2/wrapper.rs). It returns an iterator
+of `Result<Vec<f32>>` chunks at `model.sample_rate()`:
+
+```rust
+let opts = GenerateOptions::builder()
+    .chunk_patches(5)   // ~400 ms / chunk at the default model config
+    .build();
+
+for chunk in model.generate_stream("Streaming hello!", opts)? {
+    let chunk = chunk?;
+    audio_sink.write(&chunk); // play / send / encode immediately
+}
+```
+
+Concatenating every chunk yields exactly the same waveform `generate()`
+would have returned — chunk boundaries are seamless because the AudioVAE
+decoder is causal. `chunk_patches` trades latency for throughput: smaller
+→ lower per-chunk latency, larger → fewer chunks. The default `5` is a
+sensible balance for live playback.
+
+See [`examples/tts_stream.rs`](examples/tts_stream.rs) for an end-to-end
+run with per-chunk timing.
+
+> **Implementation note.** The autoregressive loop (LM + DiT) runs
+> incrementally with KV-cache, so streaming adds **no** AR overhead
+> compared to `generate()`. The AudioVAE decoder, however, is currently
+> stateless across chunks — each chunk re-decodes the cumulative latent
+> and emits only the new tail samples, making total VAE work
+> `O(N²/chunk_patches)` over an utterance instead of `O(N)`. AR cost
+> dominates in practice, so the difference is rarely visible.
+
 ### Tuning knobs
 
 All options flow through the fluent builder:
@@ -222,6 +259,7 @@ let opts = GenerateOptions::builder()
     .timesteps(10)     // diffusion Euler steps; fewer = faster, <6 degrades
     .min_len(2)
     .max_len(500)      // hard cap on generated latent patches (~80 ms each)
+    .chunk_patches(5)  // patches per chunk in `generate_stream`
     .build();
 ```
 
@@ -282,6 +320,7 @@ so HuggingFace checkpoints drop in with no manual conversion step.
 Browse [`examples/`](examples/) for standalone binaries:
 
 - [`tts.rs`](examples/tts.rs) — end-to-end synthesis.
+- [`tts_stream.rs`](examples/tts_stream.rs) — chunked streaming synthesis with per-chunk latency logging.
 - [`clone.rs`](examples/clone.rs) — voice cloning from a reference wav.
 - [`lm_check.rs`](examples/lm_check.rs), [`vae_check.rs`](examples/vae_check.rs),
   [`feat_check.rs`](examples/feat_check.rs) — per-component parity checks against
