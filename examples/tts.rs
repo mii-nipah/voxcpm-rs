@@ -21,11 +21,12 @@ use std::time::Instant;
 use voxcpm_rs::{audio, GenerateOptions, VoxCPM};
 
 // NOTE on Vulkan + bf16:
-//   The cubecl-spirv path in burn 0.20 has at least three independent bf16
-//   bugs (silu inflates ~150x; cast(F32->BF16) corrupts subsequent bf16 ops;
-//   mixed-dtype matmul is broken). bf16 inference therefore produces silence
-//   or saturation. The `vulkan` feature defaults to f32 here. Switch the
-//   element type to `half::bf16` to test future cubecl fixes.
+//   The cubecl-spirv path in burn 0.20 has broken bf16 *elementwise* codegen
+//   on AMD radv (and possibly elsewhere): pure bf16 ops give garbage like
+//   `10*2 = 2560`, `sqrt(4) = 0.125`. See `examples/bf16_probe.rs` for a
+//   minimal repro. Matmul (cooperative-matrix path) and mixed f32*bf16 are
+//   fine. The `vulkan` feature therefore defaults to f32 here; switch to
+//   `half::bf16` to retest once cubecl-spirv fixes elementwise codegen.
 #[cfg(all(feature = "vulkan", not(feature = "wgpu")))]
 type B = burn::backend::Vulkan<f32, i32>;
 #[cfg(all(feature = "wgpu", not(feature = "vulkan")))]

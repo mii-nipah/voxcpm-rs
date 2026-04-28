@@ -79,16 +79,17 @@ pub fn apply_rotary_pos_emb<B: Backend>(
     cos: Tensor<B, 2>,
     sin: Tensor<B, 2>,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    // Note: Python casts q/k to f32 for the rotation. We *don't* mirror that
-    // on bf16 backends because chaining a `cast(F32)` -> ops -> `cast(BF16)`
-    // through the cubecl Vulkan/SPIR-V graph triggers a downstream
-    // dtype-promotion bug that inflates subsequent additions by 40-100x. The
-    // rotation itself is just element-wise mul/add over `head_dim`, which
-    // bf16 handles cleanly without any reduction. RMSNorm and SiLU are the
-    // ones that genuinely need f32 (and they upcast internally).
-    let cos4: Tensor<B, 4> = cos.unsqueeze();
-    let sin4: Tensor<B, 4> = sin.unsqueeze();
-    let q_embed = q.clone() * cos4.clone() + rotate_half(q) * sin4.clone();
-    let k_embed = k.clone() * cos4 + rotate_half(k) * sin4;
-    (q_embed, k_embed)
+    // Match Python reference: cast q/k to f32 for the rotation, cast back at
+    // the end. The rotation itself is only element-wise mul/add over the
+    // head_dim, but Python upcasts here for numerical headroom around the
+    // cos/sin range. On pure-f32 backends every `cast` is a no-op so this is
+    // free.
+    let orig: burn::tensor::FloatDType = q.dtype().into();
+    let qf = q.cast(burn::tensor::FloatDType::F32);
+    let kf = k.cast(burn::tensor::FloatDType::F32);
+    let cos4: Tensor<B, 4> = cos.cast(burn::tensor::FloatDType::F32).unsqueeze();
+    let sin4: Tensor<B, 4> = sin.cast(burn::tensor::FloatDType::F32).unsqueeze();
+    let q_embed = qf.clone() * cos4.clone() + rotate_half(qf) * sin4.clone();
+    let k_embed = kf.clone() * cos4 + rotate_half(kf) * sin4;
+    (q_embed.cast(orig), k_embed.cast(orig))
 }

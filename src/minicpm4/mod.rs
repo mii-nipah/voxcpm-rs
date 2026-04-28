@@ -20,9 +20,12 @@ use burn::tensor::activation::sigmoid;
 /// to the input dtype.
 ///
 /// `burn::tensor::activation::silu` produces wildly inflated outputs on the
-/// cubecl Vulkan/SPIR-V bf16 path (e.g. `silu(23.75) ≈ 3616`). Doing it
-/// ourselves in f32 sidesteps that bug. On pure-f32 backends every `cast` is
-/// a no-op so this stays free.
+/// cubecl Vulkan/SPIR-V bf16 path (e.g. `silu(23.75) ≈ 3616`). This is not a
+/// silu bug per se: bf16 *elementwise multiply* is broken in that backend
+/// (`10*2 = 2560`, see `examples/bf16_probe.rs`) and silu = `x * sigmoid(x)`
+/// inherits the broken multiply. Doing both the mul and sigmoid in f32 here
+/// sidesteps it. On pure-f32 backends every `cast` is a no-op so this stays
+/// free.
 pub fn silu_stable<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
     let orig: burn::tensor::FloatDType = x.dtype().into();
     let xf = x.cast(burn::tensor::FloatDType::F32);
@@ -49,13 +52,11 @@ impl<B: Backend> MiniCpmRmsNorm<B> {
     }
 
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
-        // Match Python reference: variance and normalization in f32 for
-        // numerical stability when the active dtype is bf16/f16. We also
-        // promote the weight to f32 before the final scale, then cast the
-        // whole result back. Doing the scale in mixed dtypes (f32 normalized
-        // * bf16 weight) hits a broadcasting / dtype-promotion bug on the
-        // cubecl Vulkan backend that produces wildly inflated outputs. For
-        // pure-f32 backends every `cast` is a no-op so this stays free.
+        // Match Python reference (`rms_layernorm`): variance and
+        // normalization in f32 for numerical stability when the active dtype
+        // is bf16/f16. We also promote the weight to f32 before the final
+        // scale, then cast the whole result back. On pure-f32 backends every
+        // `cast` is a no-op so this stays free.
         let orig_dtype: burn::tensor::FloatDType = x.dtype().into();
         let x_f32 = x.cast(burn::tensor::FloatDType::F32);
         let x_sq = x_f32.clone() * x_f32.clone();
