@@ -20,16 +20,24 @@ use std::time::Instant;
 
 use voxcpm_rs::{audio, GenerateOptions, VoxCPM};
 
-#[cfg(feature = "wgpu")]
+#[cfg(all(feature = "vulkan", not(feature = "wgpu")))]
+type B = burn::backend::Vulkan<half::bf16, i32>;
+#[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 type B = burn::backend::Wgpu<f32, i32>;
-#[cfg(all(not(feature = "wgpu"), feature = "cpu"))]
+#[cfg(all(feature = "wgpu", feature = "vulkan"))]
+type B = burn::backend::Vulkan<half::bf16, i32>;
+#[cfg(all(not(feature = "wgpu"), not(feature = "vulkan"), feature = "cpu"))]
 type B = burn::backend::NdArray<f32>;
 
-#[cfg(feature = "wgpu")]
+#[cfg(feature = "vulkan")]
+fn backend_name() -> &'static str {
+    "vulkan (bf16)"
+}
+#[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 fn backend_name() -> &'static str {
     "wgpu"
 }
-#[cfg(all(not(feature = "wgpu"), feature = "cpu"))]
+#[cfg(all(not(feature = "wgpu"), not(feature = "vulkan"), feature = "cpu"))]
 fn backend_name() -> &'static str {
     "ndarray"
 }

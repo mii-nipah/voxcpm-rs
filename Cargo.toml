@@ -25,6 +25,11 @@ default = ["cpu"]
 # Vulkan / WGPU backend (primary target: AMD + NVIDIA via wgpu).
 # Minimal build: fast cold start, ~5-7% slower steady-state.
 wgpu = ["burn/wgpu"]
+# Vulkan-only variant of `wgpu`: routes through cubecl-spirv instead of WGSL.
+# Unlocks bf16 / f16 native types, cooperative-matrix (matrix cores) on RDNA3+
+# and NVIDIA Ampere+, and other Vulkan-only extensions. Linux/Windows/Android
+# only (no Metal, no WebGPU, no DX12).
+vulkan = ["burn/wgpu", "burn/vulkan"]
 # Opt-in perf: enables burn-cubecl-fusion (auto-fuses elementwise chains
 # into single GPU kernels) and cubecl autotune (picks the best matmul
 # kernel per shape). Gains ~5-7% steady-state RTF but pays a cold-start
