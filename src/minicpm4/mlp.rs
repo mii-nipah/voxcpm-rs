@@ -1,9 +1,9 @@
 //! Gated MLP used inside each MiniCPM-4 decoder layer.
 
 use crate::config::MiniCpm4Config;
+use crate::minicpm4::silu_stable;
 use burn::nn::{Linear, LinearConfig};
 use burn::prelude::*;
-use burn::tensor::activation::silu;
 
 #[derive(Module, Debug)]
 pub struct MiniCpmMlp<B: Backend> {
@@ -30,6 +30,6 @@ impl<B: Backend> MiniCpmMlp<B> {
         let last = D - 1;
         let gate = gu.clone().narrow(last, 0, self.inter);
         let up = gu.narrow(last, self.inter, self.inter);
-        self.down_proj.forward(silu(gate) * up)
+        self.down_proj.forward(silu_stable(gate) * up)
     }
 }

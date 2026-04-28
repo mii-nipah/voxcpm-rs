@@ -79,7 +79,13 @@ pub fn apply_rotary_pos_emb<B: Backend>(
     cos: Tensor<B, 2>,
     sin: Tensor<B, 2>,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    // Unsqueeze cos/sin to [1, 1, S, D] so they broadcast over B,H.
+    // Note: Python casts q/k to f32 for the rotation. We *don't* mirror that
+    // on bf16 backends because chaining a `cast(F32)` -> ops -> `cast(BF16)`
+    // through the cubecl Vulkan/SPIR-V graph triggers a downstream
+    // dtype-promotion bug that inflates subsequent additions by 40-100x. The
+    // rotation itself is just element-wise mul/add over `head_dim`, which
+    // bf16 handles cleanly without any reduction. RMSNorm and SiLU are the
+    // ones that genuinely need f32 (and they upcast internally).
     let cos4: Tensor<B, 4> = cos.unsqueeze();
     let sin4: Tensor<B, 4> = sin.unsqueeze();
     let q_embed = q.clone() * cos4.clone() + rotate_half(q) * sin4.clone();

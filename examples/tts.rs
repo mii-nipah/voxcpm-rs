@@ -20,18 +20,24 @@ use std::time::Instant;
 
 use voxcpm_rs::{audio, GenerateOptions, VoxCPM};
 
+// NOTE on Vulkan + bf16:
+//   The cubecl-spirv path in burn 0.20 has at least three independent bf16
+//   bugs (silu inflates ~150x; cast(F32->BF16) corrupts subsequent bf16 ops;
+//   mixed-dtype matmul is broken). bf16 inference therefore produces silence
+//   or saturation. The `vulkan` feature defaults to f32 here. Switch the
+//   element type to `half::bf16` to test future cubecl fixes.
 #[cfg(all(feature = "vulkan", not(feature = "wgpu")))]
-type B = burn::backend::Vulkan<half::bf16, i32>;
+type B = burn::backend::Vulkan<f32, i32>;
 #[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 type B = burn::backend::Wgpu<f32, i32>;
 #[cfg(all(feature = "wgpu", feature = "vulkan"))]
-type B = burn::backend::Vulkan<half::bf16, i32>;
+type B = burn::backend::Vulkan<f32, i32>;
 #[cfg(all(not(feature = "wgpu"), not(feature = "vulkan"), feature = "cpu"))]
 type B = burn::backend::NdArray<f32>;
 
 #[cfg(feature = "vulkan")]
 fn backend_name() -> &'static str {
-    "vulkan (bf16)"
+    "vulkan (f32, SPIR-V)"
 }
 #[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 fn backend_name() -> &'static str {

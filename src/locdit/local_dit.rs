@@ -4,7 +4,7 @@ use crate::config::MiniCpm4Config;
 use crate::minicpm4::MiniCpmModel;
 use burn::nn::{Linear, LinearConfig};
 use burn::prelude::*;
-use burn::tensor::activation::silu;
+use crate::minicpm4::silu_stable as silu;
 use burn::tensor::TensorData;
 
 /// Sinusoidal timestep embedding (even dim required).

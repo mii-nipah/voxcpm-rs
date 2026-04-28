@@ -243,7 +243,7 @@ impl<B: Backend> VoxCpm2Model<B> {
         // Stop check (cheap GPU→CPU sync via argmax).
         let stop_logits = self
             .stop_head
-            .forward(burn::tensor::activation::silu(self.stop_proj.forward(state.lm_hidden.clone())));
+            .forward(crate::minicpm4::silu_stable(self.stop_proj.forward(state.lm_hidden.clone())));
         let stop = stop_logits
             .argmax(1)
             .into_data()
