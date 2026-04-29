@@ -21,24 +21,23 @@ use std::time::Instant;
 use voxcpm_rs::{audio, GenerateOptions, VoxCPM};
 
 // NOTE on Vulkan + bf16:
-//   The cubecl-spirv path in burn 0.20 has broken bf16 *elementwise* codegen
-//   on AMD radv (and possibly elsewhere): pure bf16 ops give garbage like
-//   `10*2 = 2560`, `sqrt(4) = 0.125`. See `examples/bf16_probe.rs` for a
-//   minimal repro. Matmul (cooperative-matrix path) and mixed f32*bf16 are
-//   fine. The `vulkan` feature therefore defaults to f32 here; switch to
-//   `half::bf16` to retest once cubecl-spirv fixes elementwise codegen.
+//   The `vulkan` feature runs the model in native bf16 end-to-end via
+//   cubecl-spirv. This requires the patched `burn-cubecl` and `cubecl-spirv`
+//   crates from this repo (see `patches/README.md` and the workspace
+//   `[patch.crates-io]` block) — without them, bf16 conv accumulators
+//   collapse and several bf16 ops emit broken SPIR-V on mesa/radv.
 #[cfg(all(feature = "vulkan", not(feature = "wgpu")))]
-type B = burn::backend::Vulkan<f32, i32>;
+type B = burn::backend::Vulkan<half::bf16, i32>;
 #[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 type B = burn::backend::Wgpu<f32, i32>;
 #[cfg(all(feature = "wgpu", feature = "vulkan"))]
-type B = burn::backend::Vulkan<f32, i32>;
+type B = burn::backend::Vulkan<half::bf16, i32>;
 #[cfg(all(not(feature = "wgpu"), not(feature = "vulkan"), feature = "cpu"))]
 type B = burn::backend::NdArray<f32>;
 
 #[cfg(feature = "vulkan")]
 fn backend_name() -> &'static str {
-    "vulkan (f32, SPIR-V)"
+    "vulkan (bf16, SPIR-V)"
 }
 #[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 fn backend_name() -> &'static str {

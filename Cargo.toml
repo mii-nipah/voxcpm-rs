@@ -72,3 +72,28 @@ env_logger = "0.11"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# Local forks with bug fixes for native bf16 on the cubecl-spirv (Vulkan)
+# path. See `patches/README.md` for full details. TL;DR:
+#
+# - burn-cubecl 0.20.1: direct conv kernels (forward and transposed)
+#   accumulated sums in the element type `E`; for bf16 inputs this
+#   collapses long reductions toward zero (audiovae's transposed convs
+#   sum ~32k bf16 multiplies per output → silent audio). Fix: accumulate
+#   in f32, cast back on store. See `patches/burn-cubecl-bf16-acc.patch`.
+#
+# - cubecl-spirv 0.9.0: adds an IR transformer that promotes bf16
+#   arithmetic / comparison / plane / select ops to f32 before SPIR-V
+#   emission, working around radv's broken NIR translation of generic
+#   bf16 ops (only the special bfmul/bffma/bfdot intrinsics actually
+#   work on mesa 25.2). See `patches/cubecl-spirv-bf16-promote.patch`.
+#
+# This patch block applies to OUR workspace. Downstream users that depend
+# on voxcpm-rs and want the bf16 build must paste an equivalent block
+# into THEIR own workspace root (cargo doesn't propagate [patch] from
+# dependencies). They get the patched copies via a `git = ...` reference
+# to this repo — see `patches/README.md` for the exact 3 lines.
+
+[patch.crates-io]
+burn-cubecl = { path = "vendor/patched/burn-cubecl" }
+cubecl-spirv = { path = "vendor/patched/cubecl-spirv" }

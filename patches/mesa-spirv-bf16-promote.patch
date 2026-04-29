@@ -1,0 +1,129 @@
+diff --git a/src/compiler/spirv/vtn_alu.c b/src/compiler/spirv/vtn_alu.c
+index 1a4d89c..5509c85 100644
+--- a/src/compiler/spirv/vtn_alu.c
++++ b/src/compiler/spirv/vtn_alu.c
+@@ -822,6 +822,57 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
+       src[i] = vtn_src[i]->def;
+    }
+ 
++   /* SPV_KHR_bfloat16: bfloat16 arithmetic ops are not natively supported by
++    * NIR (other than bfmul/bffma/bfdot). Promote operands to f32, perform the
++    * op in f32, and demote back to bf16. This mirrors the strategy used in
++    * vtn_handle_convert() for bf16 conversions and matches the spec language
++    * "Conversions to or from floating-point values with the BFloat16KHR
++    * encoding first convert the source value to IEEE754 binary32".
++    *
++    * Without this, plain SpvOpFAdd/FSub/FMul/FDiv/FMod/FRem/FNegate fall
++    * through to the default arm and produce nir_op_fadd/fmul/etc. with
++    * bit_size=16, which the backend (e.g. ACO on RDNA) emits as IEEE-f16
++    * instructions. The bf16 bit pattern is then interpreted as f16 and the
++    * result is garbage.
++    */
++   bool bf16_promoted = false;
++   if (num_inputs > 0 && glsl_type_is_bfloat_16(vtn_src[0]->type)) {
++      switch (opcode) {
++      case SpvOpFAdd:
++      case SpvOpFSub:
++      case SpvOpFMul:
++      case SpvOpFDiv:
++      case SpvOpFMod:
++      case SpvOpFRem:
++      case SpvOpFNegate:
++         for (unsigned i = 0; i < num_inputs; i++)
++            src[i] = nir_bf2f(&b->nb, src[i]);
++         bf16_promoted = true;
++         break;
++      /* Comparison ops also need promotion: the result is bool so we don't
++       * demote at the end, but the operands must be compared as f32 because
++       * the f16 ALU compare interprets bf16 bit patterns wrong. */
++      case SpvOpFOrdEqual:
++      case SpvOpFUnordEqual:
++      case SpvOpFOrdNotEqual:
++      case SpvOpFUnordNotEqual:
++      case SpvOpFOrdLessThan:
++      case SpvOpFUnordLessThan:
++      case SpvOpFOrdGreaterThan:
++      case SpvOpFUnordGreaterThan:
++      case SpvOpFOrdLessThanEqual:
++      case SpvOpFUnordLessThanEqual:
++      case SpvOpFOrdGreaterThanEqual:
++      case SpvOpFUnordGreaterThanEqual:
++         for (unsigned i = 0; i < num_inputs; i++)
++            src[i] = nir_bf2f(&b->nb, src[i]);
++         /* don't set bf16_promoted: result is bool, no demote needed */
++         break;
++      default:
++         break;
++      }
++   }
++
+    switch (opcode) {
+    case SpvOpAny:
+       dest->def = nir_bany(&b->nb, src[0]);
+@@ -1158,6 +1209,11 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
+ 
+    if (mediump_16bit)
+       vtn_mediump_upconvert_value(b, dest);
++
++   /* Demote bf16 arithmetic results back to bf16 (see promotion above). */
++   if (bf16_promoted)
++      dest->def = nir_f2bf(&b->nb, dest->def);
++
+    vtn_push_ssa_value(b, w[2], dest);
+ 
+    b->nb.exact = b->exact;
+diff --git a/src/compiler/spirv/vtn_glsl450.c b/src/compiler/spirv/vtn_glsl450.c
+index 5114011..29e5723 100644
+--- a/src/compiler/spirv/vtn_glsl450.c
++++ b/src/compiler/spirv/vtn_glsl450.c
+@@ -341,6 +341,39 @@ handle_glsl450_alu(struct vtn_builder *b, enum GLSLstd450 entrypoint,
+       }
+    }
+ 
++   /* SPV_KHR_bfloat16: NIR has no native bf16 transcendental/math ops, so
++    * promote bf16 operands to f32 here, perform the op in f32, then demote
++    * the result back to bf16. Mirrors the strategy in vtn_handle_convert()
++    * (see comment there) and matches the spec language requiring conversion
++    * via IEEE754 binary32. Without this, ops like Sqrt/Exp/Log on bf16
++    * would dispatch nir_op_fsqrt/fexp/flog with bit_size=16, which the
++    * backend (e.g. ACO on RDNA) emits as IEEE-f16 instructions on bf16 bit
++    * patterns, producing garbage.
++    *
++    * We skip the special opcodes whose source/dest layout we don't
++    * understand here (Frexp/Modf produce struct or write through pointers).
++    */
++   bool bf16_promoted = false;
++   if (num_inputs > 0 && src[0] != NULL && glsl_type_is_bfloat_16(dest_type)) {
++      switch (entrypoint) {
++      case GLSLstd450Frexp:
++      case GLSLstd450FrexpStruct:
++      case GLSLstd450Modf:
++      case GLSLstd450ModfStruct:
++      case GLSLstd450Ldexp:
++         /* Skip: irregular signatures or already integer-typed args. */
++         break;
++      default:
++         for (unsigned i = 0; i < num_inputs; i++) {
++            if (src[i] != NULL && src[i]->bit_size == 16 &&
++                glsl_type_is_bfloat_16(vtn_ssa_value(b, w[i + 5])->type))
++               src[i] = nir_bf2f(nb, src[i]);
++         }
++         bf16_promoted = true;
++         break;
++      }
++   }
++
+    struct vtn_ssa_value *dest = vtn_create_ssa_value(b, dest_type);
+ 
+    vtn_handle_no_contraction(b, vtn_untyped_value(b, w[2]));
+@@ -654,6 +687,10 @@ handle_glsl450_alu(struct vtn_builder *b, enum GLSLstd450 entrypoint,
+    if (mediump_16bit)
+       vtn_mediump_upconvert_value(b, dest);
+ 
++   /* Demote bf16 result back to bf16 (see promotion above). */
++   if (bf16_promoted && dest->def != NULL)
++      dest->def = nir_f2bf(nb, dest->def);
++
+    vtn_push_ssa_value(b, w[2], dest);
+ }
+ 
