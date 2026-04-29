@@ -20,16 +20,30 @@ use std::time::Instant;
 
 use voxcpm_rs::{audio, GenerateOptions, VoxCPM};
 
-#[cfg(feature = "wgpu")]
+// NOTE on Vulkan + bf16:
+//   The `vulkan` feature runs the model in native bf16 end-to-end via
+//   cubecl-spirv. This requires the patched `burn-cubecl` and `cubecl-spirv`
+//   crates from this repo (see `patches/README.md` and the workspace
+//   `[patch.crates-io]` block) — without them, bf16 conv accumulators
+//   collapse and several bf16 ops emit broken SPIR-V on mesa/radv.
+#[cfg(all(feature = "vulkan", not(feature = "wgpu")))]
+type B = burn::backend::Vulkan<half::bf16, i32>;
+#[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 type B = burn::backend::Wgpu<f32, i32>;
-#[cfg(all(not(feature = "wgpu"), feature = "cpu"))]
+#[cfg(all(feature = "wgpu", feature = "vulkan"))]
+type B = burn::backend::Vulkan<half::bf16, i32>;
+#[cfg(all(not(feature = "wgpu"), not(feature = "vulkan"), feature = "cpu"))]
 type B = burn::backend::NdArray<f32>;
 
-#[cfg(feature = "wgpu")]
+#[cfg(feature = "vulkan")]
+fn backend_name() -> &'static str {
+    "vulkan (bf16, SPIR-V)"
+}
+#[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 fn backend_name() -> &'static str {
     "wgpu"
 }
-#[cfg(all(not(feature = "wgpu"), feature = "cpu"))]
+#[cfg(all(not(feature = "wgpu"), not(feature = "vulkan"), feature = "cpu"))]
 fn backend_name() -> &'static str {
     "ndarray"
 }

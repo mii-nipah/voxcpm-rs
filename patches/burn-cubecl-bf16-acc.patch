@@ -1,0 +1,34 @@
+=== src/kernel/conv/conv_transpose2d/transpose_direct.rs ===
+--- /tmp/orig.rs	2026-04-28 13:18:13.465907135 -0300
++++ src/kernel/conv/conv_transpose2d/transpose_direct.rs	2026-04-28 13:04:55.204069873 -0300
+@@ -69,7 +69,10 @@
+     let idx_input_batch = batch * input.stride(0);
+     let idx_weight_oc = out_c * weight.stride(1);
+ 
+-    let mut sum = bias[oc_out];
++    // Accumulate in f32 to avoid catastrophic precision loss when E is bf16/f16
++    // (a thousands-deep multiply-add chain in 7-mantissa-bit bf16 collapses
++    // small signals to zero — see voxcpm-rs audiovae transposed conv).
++    let mut sum = f32::cast_from(bias[oc_out]);
+ 
+     let numerator_h_base = out_y + args.padding_0;
+     let numerator_w_base = out_x + args.padding_1;
+@@ -106,14 +109,14 @@
+                         let value = input[index_input];
+                         let weight = weight[index_weight];
+ 
+-                        sum += value * weight;
++                        sum += f32::cast_from(value) * f32::cast_from(weight);
+                     }
+                 }
+             }
+         }
+     }
+ 
+-    output[ABSOLUTE_POS] = sum;
++    output[ABSOLUTE_POS] = E::cast_from(sum);
+ }
+ 
+ /// Perform a 2D convolution transposition using the direct algorithm.
+=== src/kernel/conv/direct.rs ===
+bash: /tmp/orig.rs: cannot overwrite existing file

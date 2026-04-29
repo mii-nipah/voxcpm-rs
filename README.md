@@ -141,6 +141,7 @@ Pick exactly one backend:
 | `cpu-blas`     | `cpu` + vendored OpenBLAS | Multi-core matmul. Builds OpenBLAS from source (no system deps).    |
 | `wgpu`         | Vulkan / Metal / DX12 | Recommended for GPUs. Fast cold start.                              |
 | `wgpu-fast`    | `wgpu` + fusion + autotune | ~5–7% faster steady-state; pays a one-time autotune cost (cached). |
+| `vulkan`       | Native Vulkan + **bf16** weights | ~2.6× faster than `wgpu` on AMD RDNA4. **Requires a patch** — see below. |
 
 ```bash
 # CPU + BLAS
@@ -152,6 +153,37 @@ cargo run --release --example tts --no-default-features --features wgpu-fast -- 
 
 > **Tip:** with `wgpu-fast`, set `CUBECL_AUTOTUNE_LEVEL=minimal` to shrink the
 > first-run autotune cost. Results are cached in `target/autotune/`.
+
+### Bf16 Vulkan backend (opt-in, fastest path)
+
+The `vulkan` feature uses Burn's native Vulkan backend and runs the model in
+**bf16** end-to-end (the upstream weight dtype — no f32 upcast, half the VRAM,
+substantially faster on bf16-capable hardware). Verified ~2.6× speedup over
+`wgpu` on an AMD RX 9070 XT (RDNA4).
+
+It needs two small patches that aren't in the released `burn-cubecl` /
+`cubecl-spirv` crates yet — one fixes a conv accumulator dtype, the other
+promotes a handful of bf16 SPIR-V ops that mesa's NIR translator doesn't lower
+correctly. Add this to **your project's** `Cargo.toml` (alongside
+`voxcpm-rs = { …, features = ["vulkan"] }`):
+
+```toml
+[patch.crates-io]
+burn-cubecl  = { git = "https://github.com/mii-nipah/voxcpm-rs", branch = "main" }
+cubecl-spirv = { git = "https://github.com/mii-nipah/voxcpm-rs", branch = "main" }
+```
+
+That's it — `cargo` clones the repo, finds the patched crates by name, and
+rebuilds. No mesa rebuild, no environment variables, no extra steps. Pin to a
+specific `rev = "…"` instead of `branch = "main"` for reproducible builds.
+
+> **Why a patch and not a published crate?** Cargo's `[patch.crates-io]` only
+> takes effect at the workspace root, so a library can't transparently pull in
+> a patched dependency on its consumers' behalf — the patch block must live in
+> the consumer's manifest either way. A `git = "…"` reference is the lowest-
+> friction form that doesn't require maintaining renamed forks on crates.io.
+> See [`patches/README.md`](patches/README.md) for the patch contents and
+> rationale.
 
 ## API tour
 
