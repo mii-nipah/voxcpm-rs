@@ -170,6 +170,27 @@ pub struct GenerateOptions {
     /// [`VoxCPM::generate`] path. Default: `5` (~400 ms / chunk @ default
     /// model config).
     pub chunk_patches: usize,
+    /// **Opt-in parallel-segment generation.** When `Some(N)` and the input
+    /// text contains multiple sentences, [`VoxCPM::generate`] splits the
+    /// text on sentence boundaries and decodes up to `N` segments in a
+    /// single batched forward pass. On a launch-bound GPU (most consumer
+    /// cards at batch=1 / seq=1 decode) this yields near-`N`× throughput.
+    ///
+    /// Voice consistency:
+    /// - With [`Prompt::Reference`]: the user's reference is used for every
+    ///   segment — voice is consistent across the whole output.
+    /// - With [`Prompt::None`]: the *first* segment is generated serially
+    ///   to establish a voice, then its audio is used as a reference for
+    ///   the remaining segments (which are decoded in batched groups).
+    /// - With [`Prompt::Continuation`] / [`Prompt::Combined`]: parallel
+    ///   mode is silently disabled and the call falls back to the
+    ///   single-segment serial path.
+    ///
+    /// `None` (the default) preserves the original behaviour exactly. Set
+    /// to `Some(2)` for the conservative 2× sweet spot, `Some(4)` for
+    /// aggressive throughput on a strong GPU, or `Some(8)` to push as far
+    /// as the launch-bound regime allows.
+    pub parallel_segments: Option<usize>,
 }
 
 impl Default for GenerateOptions {
@@ -182,6 +203,7 @@ impl Default for GenerateOptions {
             prompt: Prompt::None,
             cancel: None,
             chunk_patches: 5,
+            parallel_segments: None,
         }
     }
 }
@@ -244,6 +266,12 @@ impl GenerateOptionsBuilder {
     /// [`VoxCPM::generate_stream`]).
     pub fn chunk_patches(mut self, n: usize) -> Self {
         self.inner.chunk_patches = n;
+        self
+    }
+    /// Enable opt-in parallel-segment generation with batch size `n`.
+    /// See [`GenerateOptions::parallel_segments`].
+    pub fn parallel_segments(mut self, n: usize) -> Self {
+        self.inner.parallel_segments = Some(n);
         self
     }
     /// Finalize into a [`GenerateOptions`].
@@ -399,6 +427,17 @@ impl<B: Backend> VoxCPM<B> {
     /// - [`Prompt::Combined`] — both a reference prefix and a continuation
     ///   suffix.
     pub fn generate(&self, text: &str, opts: GenerateOptions) -> crate::Result<Vec<f32>> {
+        // Parallel-segment fast path: opt-in via `parallel_segments`.
+        // Falls back to serial below if any precondition isn't met.
+        if let Some(parallel_n) = opts.parallel_segments {
+            if parallel_n >= 2 && matches!(opts.prompt, Prompt::None | Prompt::Reference { .. }) {
+                let segments = split_sentences(text);
+                if segments.len() >= 2 {
+                    return self.generate_parallel(&segments, parallel_n, &opts);
+                }
+            }
+        }
+
         let inputs = self.build_inference_inputs(text, &opts.prompt)?;
 
         // Wrap the cancel token (if any) into a `dyn Fn() -> bool` so the
@@ -407,7 +446,7 @@ impl<B: Backend> VoxCPM<B> {
             let c = c.clone();
             Box::new(move || c.is_cancelled()) as Box<dyn Fn() -> bool>
         });
-        let latent = self.model.inference(
+        let (latent, _stop_steps) = self.model.inference(
             inputs.text_token,
             inputs.text_mask,
             inputs.feat,
@@ -601,6 +640,452 @@ impl<B: Backend> VoxCPM<B> {
             feat_mask,
         })
     }
+
+    /// Generate a single segment with a specific `Prompt`. Used by the
+    /// parallel-segment fast path to produce the first-segment seed audio.
+    /// Returns the (latent, samples) pair.
+    fn generate_one_with_prompt(
+        &self,
+        text: &str,
+        prompt: &Prompt,
+        opts: &GenerateOptions,
+        cancel_fn: Option<&dyn Fn() -> bool>,
+    ) -> crate::Result<Vec<f32>> {
+        let inputs = self.build_inference_inputs(text, prompt)?;
+        let (latent, _stops) = self.model.inference(
+            inputs.text_token,
+            inputs.text_mask,
+            inputs.feat,
+            inputs.feat_mask,
+            opts.min_len,
+            opts.max_len,
+            opts.inference_timesteps,
+            opts.cfg_value as f64,
+            cancel_fn,
+        )?;
+        decode_latent_to_samples(&self.model.audio_vae, latent)
+    }
+
+    /// Build a right-padded batched inputs tensor for `texts.len()` segments
+    /// that all share the same (optional) reference audio prefix.
+    /// Returns `(text_token[B,S], text_mask[B,S], feat[B,S,P,D],
+    /// feat_mask[B,S], prefill_lengths[B])`.
+    fn build_batched_inputs(
+        &self,
+        texts: &[&str],
+        ref_feat_opt: Option<&Tensor<B, 3>>,
+    ) -> crate::Result<(
+        Tensor<B, 2, Int>,
+        Tensor<B, 2>,
+        Tensor<B, 4>,
+        Tensor<B, 2>,
+        Vec<usize>,
+    )> {
+        let device = &self.device;
+        let p = self.model.patch_size();
+        let d = self.model.latent_dim();
+
+        // Per-row tokens / masks / feats.
+        let mut rows_tt: Vec<Vec<i64>> = Vec::with_capacity(texts.len());
+        let mut rows_tm: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        let mut rows_fm: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        let mut rows_feat_chunks: Vec<Vec<Tensor<B, 3>>> = Vec::with_capacity(texts.len());
+        let mut row_lens: Vec<usize> = Vec::with_capacity(texts.len());
+
+        let z_patch = |n: usize| -> Tensor<B, 3> { Tensor::<B, 3>::zeros([n, p, d], device) };
+
+        // Reference prefix (shared across all rows). If ref_feat is given,
+        // each row starts with [REF_START, ref×K, REF_END] of length K+2.
+        let ref_len = ref_feat_opt.map(|f| f.dims()[0]).unwrap_or(0);
+
+        for &text in texts {
+            let mut text_tokens = self.tokenizer.encode(text)?;
+            text_tokens.push(AUDIO_START_TOKEN);
+            let text_len = text_tokens.len();
+
+            let mut tt: Vec<i64> = Vec::new();
+            let mut tm: Vec<f32> = Vec::new();
+            let mut fm: Vec<f32> = Vec::new();
+            let mut feat_chunks: Vec<Tensor<B, 3>> = Vec::new();
+
+            if let Some(rf) = ref_feat_opt {
+                tt.push(REF_AUDIO_START_TOKEN);
+                tt.extend(std::iter::repeat_n(0i64, ref_len));
+                tt.push(REF_AUDIO_END_TOKEN);
+                tm.push(1.0);
+                tm.extend(std::iter::repeat_n(0.0, ref_len));
+                tm.push(1.0);
+                fm.push(0.0);
+                fm.extend(std::iter::repeat_n(1.0, ref_len));
+                fm.push(0.0);
+                feat_chunks.push(z_patch(1));
+                feat_chunks.push(rf.clone());
+                feat_chunks.push(z_patch(1));
+            }
+
+            tt.extend_from_slice(&text_tokens);
+            tm.extend(std::iter::repeat_n(1.0, text_len));
+            fm.extend(std::iter::repeat_n(0.0, text_len));
+            feat_chunks.push(z_patch(text_len));
+
+            row_lens.push(tt.len());
+            rows_tt.push(tt);
+            rows_tm.push(tm);
+            rows_fm.push(fm);
+            rows_feat_chunks.push(feat_chunks);
+        }
+
+        let max_s = *row_lens.iter().max().unwrap_or(&0);
+        if max_s == 0 {
+            return Err(crate::Error::Other("no text in any segment".into()));
+        }
+
+        // Right-pad each row to max_s.
+        let batch = texts.len();
+        let mut pad_tt = vec![0i64; batch * max_s];
+        let mut pad_tm = vec![0.0f32; batch * max_s];
+        let mut pad_fm = vec![0.0f32; batch * max_s];
+        let mut row_feats: Vec<Tensor<B, 4>> = Vec::with_capacity(batch);
+
+        for (b, ((tt, tm), (fm, mut chunks))) in rows_tt.iter().zip(rows_tm.iter())
+            .zip(rows_fm.iter().zip(rows_feat_chunks.into_iter()))
+            .enumerate()
+        {
+            let s = tt.len();
+            for j in 0..s {
+                pad_tt[b * max_s + j] = tt[j];
+                pad_tm[b * max_s + j] = tm[j];
+                pad_fm[b * max_s + j] = fm[j];
+            }
+            // Build [S, P, D] feat for this row, then pad.
+            let feat_row: Tensor<B, 3> = if chunks.len() == 1 {
+                chunks.pop().unwrap()
+            } else {
+                Tensor::cat(chunks, 0)
+            };
+            let feat_row = if s == max_s {
+                feat_row
+            } else {
+                let pad = max_s - s;
+                Tensor::cat(vec![feat_row, z_patch(pad)], 0)
+            };
+            row_feats.push(feat_row.unsqueeze::<4>()); // [1, max_s, P, D]
+        }
+
+        let text_token: Tensor<B, 2, Int> =
+            Tensor::from_data(TensorData::new(pad_tt, [batch, max_s]), device);
+        let text_mask: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(pad_tm, [batch, max_s]), device);
+        let feat_mask: Tensor<B, 2> =
+            Tensor::from_data(TensorData::new(pad_fm, [batch, max_s]), device);
+        let feat: Tensor<B, 4> = Tensor::cat(row_feats, 0);
+
+        Ok((text_token, text_mask, feat, feat_mask, row_lens))
+    }
+
+    /// Encode a slice of mono PCM samples (assumed at this model's audio
+    /// VAE sample rate) into a `[T, P, D]` reference-feature tensor,
+    /// right-padding the audio if needed. Used to turn a self-seeded first
+    /// segment into a reference for the remaining segments.
+    fn pcm_to_ref_feat(&self, samples: &[f32]) -> crate::Result<Tensor<B, 3>> {
+        // Resample from output sr (sample_rate()) to the AudioVAE encoder sr.
+        let in_sr = self.model.sample_rate() as u32;
+        let enc_sr = self.model.audio_vae.sample_rate() as u32;
+        let resampled = if in_sr == enc_sr {
+            samples.to_vec()
+        } else {
+            crate::audio::resample(samples, in_sr, enc_sr)?
+        };
+        self.encode_prompt_audio(
+            &PromptAudio::Pcm { samples: resampled, sample_rate: enc_sr },
+            PadMode::Right,
+        )
+    }
+
+    /// Run the parallel-segment generation pipeline. See
+    /// [`GenerateOptions::parallel_segments`] for the public contract.
+    /// Start building a batch of independent generations that will run in
+    /// a single batched forward pass. See [`BatchBuilder`] for the full
+    /// contract and a worked example.
+    pub fn batch(&self) -> BatchBuilder<'_, B> {
+        BatchBuilder { voxcpm: self, items: Vec::new() }
+    }
+
+    /// Internal: build per-row inputs, right-pad to max_S, batch-cat, run
+    /// `inference_with_lengths`, and decode each row's latent slice.
+    fn run_batch(
+        &self,
+        items: Vec<(String, Prompt)>,
+        opts: GenerateOptions,
+    ) -> crate::Result<Vec<Vec<f32>>> {
+        let device = &self.device;
+        let p = self.model.patch_size();
+        let d = self.model.latent_dim();
+
+        // 1) Build per-item B=1 inputs reusing the existing single-item path.
+        let mut rows: Vec<InferenceInputs<B>> = Vec::with_capacity(items.len());
+        let mut lens: Vec<usize> = Vec::with_capacity(items.len());
+        for (text, prompt) in &items {
+            let inp = self.build_inference_inputs(text, prompt)?;
+            lens.push(inp.text_token.dims()[1]);
+            rows.push(inp);
+        }
+        let max_s = *lens.iter().max().unwrap();
+
+        // 2) Right-pad each row to max_s with zeros, then cat along dim 0.
+        let mut tt_rows: Vec<Tensor<B, 2, Int>> = Vec::with_capacity(rows.len());
+        let mut tm_rows: Vec<Tensor<B, 2>> = Vec::with_capacity(rows.len());
+        let mut fm_rows: Vec<Tensor<B, 2>> = Vec::with_capacity(rows.len());
+        let mut feat_rows: Vec<Tensor<B, 4>> = Vec::with_capacity(rows.len());
+        for (i, inp) in rows.into_iter().enumerate() {
+            let s = lens[i];
+            let pad = max_s - s;
+            let (tt, tm, ft, fm) = if pad == 0 {
+                (inp.text_token, inp.text_mask, inp.feat, inp.feat_mask)
+            } else {
+                let tt_pad: Tensor<B, 2, Int> =
+                    Tensor::zeros([1, pad], device);
+                let tm_pad: Tensor<B, 2> = Tensor::zeros([1, pad], device);
+                let fm_pad: Tensor<B, 2> = Tensor::zeros([1, pad], device);
+                let ft_pad: Tensor<B, 4> = Tensor::zeros([1, pad, p, d], device);
+                (
+                    Tensor::cat(vec![inp.text_token, tt_pad], 1),
+                    Tensor::cat(vec![inp.text_mask, tm_pad], 1),
+                    Tensor::cat(vec![inp.feat, ft_pad], 1),
+                    Tensor::cat(vec![inp.feat_mask, fm_pad], 1),
+                )
+            };
+            tt_rows.push(tt);
+            tm_rows.push(tm);
+            feat_rows.push(ft);
+            fm_rows.push(fm);
+        }
+        let text_token = Tensor::cat(tt_rows, 0);
+        let text_mask = Tensor::cat(tm_rows, 0);
+        let feat = Tensor::cat(feat_rows, 0);
+        let feat_mask = Tensor::cat(fm_rows, 0);
+
+        // 3) Run batched inference.
+        let cancel_fn: Option<Box<dyn Fn() -> bool>> = opts.cancel.as_ref().map(|c| {
+            let c = c.clone();
+            Box::new(move || c.is_cancelled()) as Box<dyn Fn() -> bool>
+        });
+        let (latent, stops) = self.model.inference_with_lengths(
+            text_token,
+            text_mask,
+            feat,
+            feat_mask,
+            opts.min_len,
+            opts.max_len,
+            opts.inference_timesteps,
+            opts.cfg_value as f64,
+            cancel_fn.as_deref(),
+            Some(lens),
+        )?;
+
+        // 4) Decode each row independently using its own stop_step.
+        let dims = latent.dims();
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(items.len());
+        for i in 0..items.len() {
+            let stop_i = stops[i];
+            let pat = (stop_i * p).min(dims[2]);
+            if pat == 0 {
+                out.push(Vec::new());
+                continue;
+            }
+            let lat_i = latent.clone().slice([i..i + 1, 0..dims[1], 0..pat]);
+            let pcm = decode_latent_to_samples(&self.model.audio_vae, lat_i)?;
+            out.push(pcm);
+        }
+        Ok(out)
+    }
+
+    fn generate_parallel(
+        &self,
+        segments: &[String],
+        parallel_n: usize,
+        opts: &GenerateOptions,
+    ) -> crate::Result<Vec<f32>> {
+        debug_assert!(parallel_n >= 2);
+        debug_assert!(segments.len() >= 2);
+
+        let cancel_fn: Option<Box<dyn Fn() -> bool>> = opts.cancel.as_ref().map(|c| {
+            let c = c.clone();
+            Box::new(move || c.is_cancelled()) as Box<dyn Fn() -> bool>
+        });
+
+        // Establish a voice reference: either the user's explicit
+        // `Prompt::Reference` audio, or a self-seed = the first segment
+        // generated serially.
+        let (ref_feat, mut output_audio): (Tensor<B, 3>, Vec<f32>) = match &opts.prompt {
+            Prompt::Reference { audio } => {
+                let rf = self.encode_prompt_audio(audio, PadMode::Right)?;
+                (rf, Vec::new())
+            }
+            Prompt::None => {
+                let seed_text = segments[0].as_str();
+                let seed_pcm = self.generate_one_with_prompt(
+                    seed_text,
+                    &Prompt::None,
+                    opts,
+                    cancel_fn.as_deref(),
+                )?;
+                let rf = self.pcm_to_ref_feat(&seed_pcm)?;
+                (rf, seed_pcm)
+            }
+            // Other prompt modes are filtered out by the dispatch in `generate`.
+            _ => unreachable!(),
+        };
+
+        // Decide which segments still need generation: skip the first if we
+        // self-seeded with it.
+        let remaining: &[String] = match &opts.prompt {
+            Prompt::None => &segments[1..],
+            _ => &segments[..],
+        };
+
+        // Process remaining segments in batched groups of `parallel_n`.
+        for group in remaining.chunks(parallel_n) {
+            let texts_ref: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
+            let (tt, tm, ft, fm, lens) =
+                self.build_batched_inputs(&texts_ref, Some(&ref_feat))?;
+            let (latent, stops) = self.model.inference_with_lengths(
+                tt, tm, ft, fm,
+                opts.min_len,
+                opts.max_len,
+                opts.inference_timesteps,
+                opts.cfg_value as f64,
+                cancel_fn.as_deref(),
+                Some(lens),
+            )?;
+            let dims = latent.dims();
+            let p = self.model.patch_size();
+            for i in 0..group.len() {
+                let stop_i = stops[i];
+                let pat = (stop_i * p).min(dims[2]);
+                if pat == 0 {
+                    continue;
+                }
+                let lat_i = latent.clone().slice([i..i + 1, 0..dims[1], 0..pat]);
+                let pcm = decode_latent_to_samples(&self.model.audio_vae, lat_i)?;
+                output_audio.extend_from_slice(&pcm);
+            }
+        }
+
+        Ok(output_audio)
+    }
+}
+
+/// Builder returned by [`VoxCPM::batch`] for generating several utterances
+/// in one batched forward pass.
+///
+/// Each item carries its own text and `Prompt`, so different items can use
+/// different voice references (or none at all). All items in a batch share
+/// the same [`GenerateOptions`] passed to [`Self::run`]; per-item
+/// `GenerateOptions::prompt` is ignored — use the prompt argument of
+/// [`Self::add`] instead.
+///
+/// # When to use this vs `parallel_segments`
+///
+/// - [`GenerateOptions::parallel_segments`]: ONE long text, automatically
+///   split into sentences sharing one voice. Self-seeds when no
+///   reference is given. Best when you want one utterance read faster.
+/// - [`VoxCPM::batch`]: MANY independent utterances, possibly with
+///   different voices. No self-seeding, no audio concatenation — you get
+///   one PCM buffer per item, in input order. Best when you have a
+///   workload of independent requests.
+///
+/// Both share the same right-pad batched prefill + per-element stop
+/// machinery, so throughput scales identically with batch size.
+///
+/// # Example
+///
+/// ```no_run
+/// use voxcpm_rs::{GenerateOptions, Prompt, VoxCPM};
+/// # type B = burn::backend::NdArray<f32>;
+/// # let model: VoxCPM<B> = unimplemented!();
+/// let opts = GenerateOptions::builder().timesteps(10).build();
+/// let outs: Vec<Vec<f32>> = model
+///     .batch()
+///     .add("Hello, world!", Prompt::None)
+///     .add("Goodbye, world!", Prompt::None)
+///     .run(opts)?;
+/// assert_eq!(outs.len(), 2);
+/// # Ok::<_, voxcpm_rs::Error>(())
+/// ```
+pub struct BatchBuilder<'a, B: Backend> {
+    voxcpm: &'a VoxCPM<B>,
+    items: Vec<(String, Prompt)>,
+}
+
+impl<'a, B: Backend> BatchBuilder<'a, B> {
+    /// Append an item to the batch. Returns `self` for chaining.
+    pub fn add(mut self, text: impl Into<String>, prompt: Prompt) -> Self {
+        self.items.push((text.into(), prompt));
+        self
+    }
+
+    /// Number of items currently in the batch.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// `true` if no items have been added.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Run the batch and return one PCM buffer (mono `f32`,
+    /// [`VoxCPM::sample_rate`]) per item, in the order they were added.
+    ///
+    /// The `opts.prompt` field is ignored — per-item prompts come from
+    /// [`Self::add`]. The `opts.parallel_segments` field is also ignored
+    /// here; this API IS the parallel batch primitive.
+    pub fn run(self, opts: GenerateOptions) -> crate::Result<Vec<Vec<f32>>> {
+        if self.items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.items.len() == 1 {
+            // Single-item shortcut: avoid all the padding overhead.
+            let (text, prompt) = self.items.into_iter().next().unwrap();
+            let cancel_fn: Option<Box<dyn Fn() -> bool>> = opts.cancel.as_ref().map(|c| {
+                let c = c.clone();
+                Box::new(move || c.is_cancelled()) as Box<dyn Fn() -> bool>
+            });
+            let pcm = self
+                .voxcpm
+                .generate_one_with_prompt(&text, &prompt, &opts, cancel_fn.as_deref())?;
+            return Ok(vec![pcm]);
+        }
+        self.voxcpm.run_batch(self.items, opts)
+    }
+}
+
+
+/// Designed for parallel-segment generation: keeps trailing whitespace
+/// trimmed and skips empty segments. Not a full ICU sentence splitter; it
+/// handles common cases (`.`, `!`, `?`, `\n`) and treats them as hard
+/// boundaries. Abbreviations like "Dr." or "U.S.A." will get split (false
+/// boundaries) but the resulting segments are still individually
+/// pronounceable, just with slightly different prosody.
+pub fn split_sentences(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for c in text.chars() {
+        buf.push(c);
+        if matches!(c, '.' | '!' | '?' | '\n') {
+            let trimmed = buf.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+            buf.clear();
+        }
+    }
+    let trimmed = buf.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_string());
+    }
+    out
 }
 
 /// Output of [`VoxCPM::build_inference_inputs`].
@@ -689,11 +1174,13 @@ impl<B: Backend> GenerateStream<'_, B> {
             // head is only honored once `i > min_len` (mirroring the
             // non-streaming path so the streamed audio is bit-identical).
             let i = self.step;
-            let crate::voxcpm2::model::DitStep { pred_feat, stop } =
+            let crate::voxcpm2::model::DitStep { pred_feat, stops } =
                 self.model.dit_step(&mut self.state, self.inference_timesteps, self.cfg_value);
             self.pred_feats.push(pred_feat.clone());
             produced_any = true;
 
+            // Streaming path is B=1; honor element 0's stop bit.
+            let stop = stops.first().copied().unwrap_or(false);
             if i > self.min_len && stop {
                 self.finished = true;
                 self.step += 1;

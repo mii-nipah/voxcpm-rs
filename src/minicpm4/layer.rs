@@ -60,10 +60,11 @@ impl<B: Backend> MiniCpmDecoderLayer<B> {
         position_emb: Option<(Tensor<B, 2>, Tensor<B, 2>)>,
         position_id: usize,
         kv_cache: &mut Option<LayerKv<B>>,
+        key_padding_mask: Option<Tensor<B, 2, burn::tensor::Bool>>,
     ) -> Tensor<B, 2> {
         let residual = hidden_states.clone();
         let h = self.input_layernorm.forward(hidden_states);
-        let h = self.self_attn.forward_step(h, position_emb, position_id, kv_cache);
+        let h = self.self_attn.forward_step(h, position_emb, position_id, kv_cache, key_padding_mask);
         let h = self.add_residual(residual, h);
 
         let residual = h.clone();

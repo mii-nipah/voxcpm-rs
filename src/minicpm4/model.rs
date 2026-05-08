@@ -67,6 +67,20 @@ impl<B: Backend> MiniCpmModel<B> {
         position_id: usize,
         cache: &mut StaticKvCache<B>,
     ) -> Tensor<B, 2> {
+        self.forward_step_masked(inputs_embeds, position_id, cache, None)
+    }
+
+    /// Same as [`Self::forward_step`] but accepts an optional
+    /// `key_padding_mask` of shape `[B, S_max]` to mask out padding
+    /// positions in the KV cache (used by batched generation where
+    /// different rows had different prefill lengths).
+    pub fn forward_step_masked(
+        &self,
+        inputs_embeds: Tensor<B, 2>,
+        position_id: usize,
+        cache: &mut StaticKvCache<B>,
+        key_padding_mask: Option<Tensor<B, 2, burn::tensor::Bool>>,
+    ) -> Tensor<B, 2> {
         let position_emb = self.rope.as_ref().map(|r| {
             let ids = Tensor::<B, 1, Int>::arange(
                 position_id as i64..(position_id + 1) as i64,
@@ -77,7 +91,13 @@ impl<B: Backend> MiniCpmModel<B> {
 
         let mut hidden = inputs_embeds;
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward_step(hidden, position_emb.clone(), position_id, cache.layer_mut(i));
+            hidden = layer.forward_step(
+                hidden,
+                position_emb.clone(),
+                position_id,
+                cache.layer_mut(i),
+                key_padding_mask.clone(),
+            );
         }
         // Apply final norm (broadcast over the singleton time dim).
         self.norm.forward(hidden)

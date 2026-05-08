@@ -25,6 +25,7 @@ voxcpm_rs::audio::write_wav("out.wav", &wav, model.sample_rate())?;
   - [Zero-shot synthesis](#zero-shot-synthesis)
   - [Voice cloning](#voice-cloning)
   - [Streaming](#streaming)
+  - [Throughput: batched & parallel-segment generation](#throughput-batched--parallel-segment-generation)
   - [Tuning knobs](#tuning-knobs)
   - [Cancellation](#cancellation)
 - [Architecture](#architecture)
@@ -281,6 +282,91 @@ run with per-chunk timing.
 > `O(N²/chunk_patches)` over an utterance instead of `O(N)`. AR cost
 > dominates in practice, so the difference is rarely visible.
 
+### Throughput: batched & parallel-segment generation
+
+Single-utterance inference at batch size 1 is launch-bound on most modern
+GPUs — the kernels are fast, but each one carries fixed dispatch overhead
+and each weight matrix is re-read from VRAM per call. Both costs amortize
+beautifully across a larger batch, so running multiple sequences through
+one forward pass gives close-to-linear speedup until you hit the actual
+compute or memory ceiling. **This benefits every backend** (Vulkan / wgpu
+/ CPU, fp32 or bf16) — it is a property of the dispatch model, not of the
+numeric format.
+
+`voxcpm-rs` exposes two complementary APIs that share the same right-pad
+batched-prefill + per-element stop machinery underneath.
+
+#### `VoxCPM::batch()` — independent utterances at once
+
+When you have several unrelated requests (a server handling N clients, a
+batch job rendering many lines), put them into one batch and get one PCM
+buffer per item back, in order. Each item carries its own [`Prompt`], so
+different items can use different reference voices in the same batch.
+
+```rust
+use voxcpm_rs::{GenerateOptions, Prompt, VoxCPM};
+
+let outs: Vec<Vec<f32>> = model
+    .batch()
+    .add("Hello, world!",          Prompt::None)
+    .add("Goodbye, world!",        Prompt::None)
+    .add("And one with a voice.",  Prompt::Reference { audio: ref_audio })
+    .run(GenerateOptions::default())?;
+
+for (i, pcm) in outs.iter().enumerate() {
+    voxcpm_rs::audio::write_wav(format!("out_{i}.wav"), pcm, model.sample_rate())?;
+}
+```
+
+Measured on an AMD RX 9070 XT (Vulkan + bf16, 8 short utterances):
+
+| Mode             | Wall time | Audio | RTF       | Speedup |
+| ---------------- | --------- | ----- | --------- | ------- |
+| serial (b=1)     | 19.9 s    | 30.1s | 0.66      | 1.00×   |
+| `batch` b=2      | 13.1 s    | 29.9s | 0.44      | 1.52×   |
+| `batch` b=4      |  9.9 s    | 29.8s | 0.33      | 2.00×   |
+| **`batch` b=8**  |  **8.6 s**| 29.0s | **0.30**  | **2.31×** |
+
+RTF below 1.0 means faster than realtime — at b=8 the GPU produces audio
+~3.4× faster than playback speed.
+
+#### `parallel_segments` — split one paragraph, share one voice
+
+For a single long text (a book chapter, a long reply), set
+[`GenerateOptions::parallel_segments(n)`]: `voxcpm-rs` splits the text on
+sentence boundaries and feeds groups of `n` segments through the same
+batched path. To keep the voice consistent across sentences when no
+reference audio is supplied, the first segment is generated serially and
+its audio is encoded as the reference for the rest ("self-seeding");
+with [`Prompt::Reference`] the user-provided voice is used directly and
+everything runs batched.
+
+```rust
+let opts = GenerateOptions::builder()
+    .parallel_segments(8)   // batch size for the segment groups
+    .build();
+let wav = model.generate("… long paragraph with many sentences …", opts)?;
+```
+
+Same hardware, 10-sentence paragraph:
+
+| Mode                       | Wall time | Audio | RTF       | Speedup vs per-sentence serial |
+| -------------------------- | --------- | ----- | --------- | ------------------------------- |
+| per-sentence serial        | 22.0 s    | 34.1s | 0.65      | 1.00×                           |
+| `parallel_segments(2)`     | 24.8 s    | 49.9s | 0.50      | 0.89×                           |
+| `parallel_segments(4)`     | 18.6 s    | 43.2s | 0.43      | 1.18×                           |
+| **`parallel_segments(8)`** | **12.8 s**| 34.1s | **0.38**  | **1.72×**                       |
+
+(The audio-length differences come from the per-sentence stop head
+firing at slightly different points; RTF is the apples-to-apples number.)
+
+**Which one to use?** If you have multiple independent inputs, prefer
+`batch()` — there is no first-segment serial step, so the speedup is
+purely batched. If you have *one* long text and want the whole thing
+ready faster, use `parallel_segments`.
+**Warning**
+Parallel segments may degrade voice consistency and quality, use with caution.
+
 ### Tuning knobs
 
 All options flow through the fluent builder:
@@ -354,6 +440,8 @@ Browse [`examples/`](examples/) for standalone binaries:
 - [`tts.rs`](examples/tts.rs) — end-to-end synthesis.
 - [`tts_stream.rs`](examples/tts_stream.rs) — chunked streaming synthesis with per-chunk latency logging.
 - [`clone.rs`](examples/clone.rs) — voice cloning from a reference wav.
+- [`bench_parallel.rs`](examples/bench_parallel.rs) — RTF benchmark for `parallel_segments` (one long paragraph).
+- [`bench_batch.rs`](examples/bench_batch.rs) — RTF benchmark for `VoxCPM::batch()` (many independent utterances).
 - [`lm_check.rs`](examples/lm_check.rs), [`vae_check.rs`](examples/vae_check.rs),
   [`feat_check.rs`](examples/feat_check.rs) — per-component parity checks against
   the reference implementation.

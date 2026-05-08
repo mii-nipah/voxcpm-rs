@@ -88,12 +88,19 @@ impl<B: Backend> MiniCpmAttention<B> {
     }
 
     /// Single-step decoding against a cached KV tensor.
+    ///
+    /// `key_padding_mask`, when present, has shape `[B, S_max]` and entries
+    /// `true` indicate cache positions that should be masked out (i.e.
+    /// padding from a batched prefill where different rows had different
+    /// real lengths). The mask is sliced to the populated cache range
+    /// before being applied.
     pub fn forward_step(
         &self,
         hidden_states: Tensor<B, 2>,
         position_emb: Option<(Tensor<B, 2>, Tensor<B, 2>)>,
         position_id: usize,
         kv_cache: &mut Option<LayerKv<B>>,
+        key_padding_mask: Option<Tensor<B, 2, burn::tensor::Bool>>,
     ) -> Tensor<B, 2> {
         let [bsz, _] = hidden_states.dims();
         let device = hidden_states.device();
@@ -145,9 +152,16 @@ impl<B: Backend> MiniCpmAttention<B> {
         // clones in SDPA — this lets the next step's slice_assign be in-place.
         *kv_cache = Some((key_cache, value_cache));
 
-        // No mask needed: cache is sliced to exactly the valid range.
+        // Build the per-batch attention mask from key_padding_mask (if any).
+        // Shape after reshape: [B, 1, 1, cur_len]. sdpa's `expand` will
+        // broadcast across heads and the singleton query dim.
+        let attn_mask: Option<Tensor<B, 4, burn::tensor::Bool>> = key_padding_mask.map(|m| {
+            // m is [B, S_max]; slice to populated range.
+            let m = m.slice([0..bsz, 0..cur_len]);
+            m.reshape([bsz, 1, 1, cur_len])
+        });
         let _ = (max_len, device);
-        let attn = self.sdpa(q, k_full, v_full, false, None);
+        let attn = self.sdpa(q, k_full, v_full, false, attn_mask);
 
         let attn = attn.swap_dims(1, 2).reshape([bsz, self.num_heads * self.head_dim]);
         self.o_proj.forward(attn)

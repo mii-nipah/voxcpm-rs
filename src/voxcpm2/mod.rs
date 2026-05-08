@@ -5,6 +5,6 @@ pub mod wrapper;
 
 pub use model::{DitStep, InferenceState, VoxCpm2Model};
 pub use wrapper::{
-    CancelToken, GenerateOptions, GenerateOptionsBuilder, GenerateStream, Prompt, PromptAudio,
-    VoxCPM,
+    BatchBuilder, CancelToken, GenerateOptions, GenerateOptionsBuilder, GenerateStream, Prompt,
+    PromptAudio, VoxCPM, split_sentences,
 };
