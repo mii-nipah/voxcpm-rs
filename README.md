@@ -364,8 +364,47 @@ firing at slightly different points; RTF is the apples-to-apples number.)
 `batch()` — there is no first-segment serial step, so the speedup is
 purely batched. If you have *one* long text and want the whole thing
 ready faster, use `parallel_segments`.
+
 **Warning**
+
 Parallel segments may degrade voice consistency and quality, use with caution.
+
+#### How far does batching scale?
+
+Batching helps as long as the GPU is launch-bound; once each step
+saturates compute or memory, adding more elements just adds proportional
+work. To find the sweet spot we generated the same medium sentence N
+times in one batch (so no element dominates) and swept N. RX 9070 XT,
+Vulkan + bf16:
+
+| Batch | Wall time | Audio | RTF      | Throughput | Speedup vs b=1 |
+| -----:| --------- | ----- | -------- | ---------- | -------------- |
+|  1    |  4.3 s    |  5.8s | 0.75     | 1.34×      | 1.00×          |
+|  2    |  4.3 s    |  8.8s | 0.49     | 2.05×      | **2.00× (free)** |
+|  4    |  5.9 s    | 18.2s | 0.32     | 3.12×      | 2.94×          |
+| **8** | **9.6 s** | 36.2s | **0.27** | **3.75×**  | **3.57×**      |
+| 16    | 22.7 s    | 76.5s | 0.30     | 3.37×      | 3.03×          |
+| 32    | 54.8 s    |151.7s | 0.36     | 2.77×      | 2.51×          |
+| 64    |192.5 s    |316.5s | 0.61     | 1.64×      | 1.43×          |
+
+Takeaways:
+
+- **b=1 → b=2 is literally free** — at b=1 the GPU is 100 % launch-bound,
+  so the second sequence rides along at zero extra cost.
+- **b=8 is the sweet spot on this card** — peak throughput 3.75× realtime.
+- **b≥16 starts regressing.** Past saturation, more batch members do not
+  hide step cost; they only add proportional work, and at b=64 something
+  (likely allocator pressure or an autotune miss for the rare giant
+  shape) makes things noticeably worse.
+- These numbers are hardware-specific. The shape of the curve
+  (free-doubling at small B, peak somewhere around 4–8, regression past
+  the GPU's saturation point) is universal — re-run
+  [`examples/batch_scale_sweep.rs`](examples/batch_scale_sweep.rs) on
+  your own hardware to find your own sweet spot.
+
+For a server batching independent requests, target b=4–8 and queue
+beyond that; for latency-sensitive interactive use, treat b=8 as the
+upper bound.
 
 ### Tuning knobs
 
@@ -442,6 +481,8 @@ Browse [`examples/`](examples/) for standalone binaries:
 - [`clone.rs`](examples/clone.rs) — voice cloning from a reference wav.
 - [`bench_parallel.rs`](examples/bench_parallel.rs) — RTF benchmark for `parallel_segments` (one long paragraph).
 - [`bench_batch.rs`](examples/bench_batch.rs) — RTF benchmark for `VoxCPM::batch()` (many independent utterances).
+- [`batch_varlen.rs`](examples/batch_varlen.rs) — 8 wildly-different-length utterances in one batched call (writes to `/tmp/voxbatching/`).
+- [`batch_scale_sweep.rs`](examples/batch_scale_sweep.rs) — sweep batch sizes 1→64 with uniform-length input to find your hardware's saturation point.
 - [`lm_check.rs`](examples/lm_check.rs), [`vae_check.rs`](examples/vae_check.rs),
   [`feat_check.rs`](examples/feat_check.rs) — per-component parity checks against
   the reference implementation.
