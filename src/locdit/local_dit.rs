@@ -150,7 +150,7 @@ impl<B: Backend> VoxCpmLocDiTV2<B> {
         let t_tok: Tensor<B, 3> = t_emb.unsqueeze_dim(1);
 
         let seq = Tensor::cat(vec![cache.mu.clone(), t_tok, cache.cond.clone(), x], 1);
-        let (hidden_out, _) = self.decoder.forward(seq, false);
+        let (hidden_out, _) = self.decoder.forward(seq, false, None);
 
         let skip = cache.prefix_len + cache.mu_tokens + 1;
         let hidden_out = hidden_out.narrow(1, skip, time_len);

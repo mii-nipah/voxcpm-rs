@@ -22,6 +22,54 @@ fn is_chinese_char(c: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
 
+const SPECIAL_TOKENS: &[&str] = &[
+    "<|denoise|>",
+    "<|lang_start|>",
+    "<|lang_end|>",
+    "<|instruct_start|>",
+    "<|instruct_end|>",
+    "<|text_start|>",
+    "<|text_end|>",
+];
+
+fn tokenize_with_special_tokens(text: &str, tokenizer: &TextTokenizer) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    let mut current_idx = 0;
+    
+    while current_idx < text.len() {
+        // Find the next occurrence of any special token
+        let mut next_special = None;
+        for &tok in SPECIAL_TOKENS {
+            if let Some(pos) = text[current_idx..].find(tok) {
+                let abs_pos = current_idx + pos;
+                match next_special {
+                    None => next_special = Some((abs_pos, tok)),
+                    Some((min_pos, _)) if abs_pos < min_pos => next_special = Some((abs_pos, tok)),
+                    _ => {}
+                }
+            }
+        }
+        
+        if let Some((abs_pos, tok)) = next_special {
+            // Encode the text segment before the special token
+            if abs_pos > current_idx {
+                let segment = &text[current_idx..abs_pos];
+                ids.extend(tokenizer.encode_raw(segment)?);
+            }
+            // Encode the special token itself
+            ids.extend(tokenizer.encode_raw(tok)?);
+            current_idx = abs_pos + tok.len();
+        } else {
+            // Encode the remainder of the text
+            let segment = &text[current_idx..];
+            ids.extend(tokenizer.encode_raw(segment)?);
+            break;
+        }
+    }
+    
+    Ok(ids)
+}
+
 impl TextTokenizer {
     pub fn from_local(dir: impl AsRef<Path>) -> Result<Self> {
         let path = dir.as_ref().join("tokenizer.json");
@@ -39,6 +87,10 @@ impl TextTokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<i64>> {
+        tokenize_with_special_tokens(text, self)
+    }
+
+    pub fn encode_raw(&self, text: &str) -> Result<Vec<i64>> {
         let enc = self
             .tokenizer
             .encode(text, false)

@@ -15,21 +15,24 @@ pub struct MiniCpmLongRope<B: Backend> {
 impl<B: Backend> MiniCpmLongRope<B> {
     pub fn new(config: &MiniCpm4Config, device: &B::Device) -> Self {
         let head_dim = config.head_dim();
-        let base = config.rope_theta as f64;
+        let base = config.get_rope_theta() as f64;
         let max_positions = config.max_position_embeddings;
-        let original = config.rope_scaling.original_max_position_embeddings;
-
-        let scale = max_positions as f64 / original as f64;
-        let scaling_factor = (1.0 + scale.ln() / (original as f64).ln()).sqrt().max(1.0);
-
-        let ext_factors: Vec<f64> = if max_positions > original {
-            config.rope_scaling.long_factor.iter().map(|x| *x as f64).collect()
-        } else {
-            config.rope_scaling.short_factor.iter().map(|x| *x as f64).collect()
-        };
-
         let half = head_dim / 2;
-        assert_eq!(ext_factors.len(), half, "rope_scaling factor length must equal head_dim/2");
+
+        let (scaling_factor, ext_factors) = if let Some(ref scaling) = config.rope_scaling {
+            let original = scaling.original_max_position_embeddings;
+            let scale = max_positions as f64 / original as f64;
+            let factor = (1.0 + scale.ln() / (original as f64).ln()).sqrt().max(1.0);
+            let ext: Vec<f64> = if max_positions > original {
+                scaling.long_factor.iter().map(|x| *x as f64).collect()
+            } else {
+                scaling.short_factor.iter().map(|x| *x as f64).collect()
+            };
+            assert_eq!(ext.len(), half, "rope_scaling factor length must equal head_dim/2");
+            (factor, ext)
+        } else {
+            (1.0, vec![1.0; half])
+        };
 
         let mut cos = vec![0f32; max_positions * head_dim];
         let mut sin = vec![0f32; max_positions * head_dim];

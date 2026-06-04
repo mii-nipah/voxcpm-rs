@@ -38,7 +38,7 @@ impl<B: Backend> VoxCpmLocEnc<B> {
         let x = Tensor::cat(vec![special, x], 2); // [B, T, P+1, H]
 
         let x: Tensor<B, 3> = x.reshape([b * t, p + 1, hidden]);
-        let (outputs, _) = self.encoder.forward(x, false); // [B*T, P+1, H]
+        let (outputs, _) = self.encoder.forward(x, false, None); // [B*T, P+1, H]
         let cls: Tensor<B, 2> = outputs.narrow(1, 0, 1).squeeze_dim::<2>(1);
         cls.reshape([b, t, hidden])
     }

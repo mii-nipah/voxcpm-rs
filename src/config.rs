@@ -9,6 +9,26 @@ use serde::{Deserialize, Serialize};
 fn default_true() -> bool {
     true
 }
+fn default_false() -> bool {
+    false
+}
+fn default_scale_emb() -> f32 {
+    1.0
+}
+fn default_dim_model_base() -> f32 {
+    256.0
+}
+fn default_scale_depth() -> f32 {
+    1.0
+}
+fn default_rope_theta() -> f32 {
+    10000.0
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RopeParameters {
+    pub rope_theta: f32,
+}
 
 fn default_patch_size() -> usize {
     4
@@ -59,26 +79,46 @@ pub struct MiniCpm4Config {
     pub num_hidden_layers: usize,
     pub num_key_value_heads: usize,
     pub rms_norm_eps: f32,
-    pub rope_scaling: RopeScalingConfig,
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScalingConfig>,
     pub vocab_size: usize,
 
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub use_mup: bool,
+    #[serde(default = "default_scale_emb")]
     pub scale_emb: f32,
+    #[serde(default = "default_dim_model_base")]
     pub dim_model_base: f32,
+    #[serde(default = "default_scale_depth")]
     pub scale_depth: f32,
+    #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
 
     #[serde(default)]
     pub kv_channels: Option<usize>,
     #[serde(default)]
     pub no_rope: bool,
+    #[serde(default)]
+    pub head_dim: Option<usize>,
+    #[serde(default)]
+    pub model_type: Option<String>,
 }
 
 impl MiniCpm4Config {
+    pub fn get_rope_theta(&self) -> f32 {
+        if let Some(ref rp) = self.rope_parameters {
+            rp.rope_theta
+        } else {
+            self.rope_theta
+        }
+    }
+
     /// Dimension of a single attention head.
     pub fn head_dim(&self) -> usize {
-        self.kv_channels
+        self.head_dim
+            .or(self.kv_channels)
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 }

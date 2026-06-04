@@ -73,13 +73,13 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     let model_pth = dir.join("model.pth");
     let model_pt = dir.join("model.pt");
     if model_st.exists() {
-        let r = load_single(model, &model_st, None, None, target_dtype)?;
+        let r = load_single(model, &model_st, None, None, target_dtype, true)?;
         merge_apply_result(&mut result, r);
     } else if model_pth.exists() {
-        let r = load_single_pth(model, &model_pth, None, None, target_dtype)?;
+        let r = load_single_pth(model, &model_pth, None, None, target_dtype, true)?;
         merge_apply_result(&mut result, r);
     } else if model_pt.exists() {
-        let r = load_single_pth(model, &model_pt, None, None, target_dtype)?;
+        let r = load_single_pth(model, &model_pt, None, None, target_dtype, true)?;
         merge_apply_result(&mut result, r);
     } else {
         return Err(Error::NotFound(format!(
@@ -98,6 +98,7 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
             Some("audio_vae."),
             Some(remap_audiovae_key),
             target_dtype,
+            true,
         )?;
         merge_apply_result(&mut result, r);
     } else if vae_pth.exists() {
@@ -107,6 +108,7 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
             Some("audio_vae."),
             Some(remap_audiovae_key),
             target_dtype,
+            true,
         )?;
         merge_apply_result(&mut result, r);
     } else {
@@ -274,6 +276,7 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
+    fuse: bool,
 ) -> Result<ApplyResult> {
     use std::time::Instant;
     // Read, materialize weight_norm, re-serialize, then hand to burn-store.
@@ -299,7 +302,7 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     log::debug!("weights[{}] mmap+parse: {:.2?}", path.display(), t0.elapsed());
     drop(st);
     drop(mmap);
-    repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
+    repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype, fuse)
 }
 
 /// Load a PyTorch pickle checkpoint (`.pt` / `.pth`) via [`burn_store`]'s
@@ -316,6 +319,7 @@ fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
+    fuse: bool,
 ) -> Result<ApplyResult> {
     use burn_store::pytorch::PytorchReader;
     use std::time::Instant;
@@ -341,7 +345,7 @@ fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
         t0.elapsed(),
         tensors.len()
     );
-    repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
+    repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype, fuse)
 }
 
 fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {    use burn::tensor::DType as B;
@@ -374,10 +378,11 @@ fn repack_and_apply<B: Backend, M: ModuleSnapshot<B>>(
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
+    fuse: bool,
 ) -> Result<ApplyResult> {
     use std::time::Instant;
     let t1 = Instant::now();
-    let synth_bytes = materialize_weight_norm(tensors, prefix, remap, target_float_dtype)?;
+    let synth_bytes = materialize_weight_norm(tensors, prefix, remap, target_float_dtype, fuse)?;
     log::debug!(
         "weights[{}] materialize+repack: {:.2?} ({} MB)",
         path.display(),
@@ -421,6 +426,7 @@ fn materialize_weight_norm(
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
+    fuse: bool,
 ) -> Result<Vec<u8>> {
     use safetensors::serialize;
 
@@ -428,13 +434,45 @@ fn materialize_weight_norm(
     let mut weight_v: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
     let mut plain: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::new();
 
+    // Stem -> (Option<original0>, Option<original1>)
+    let mut original_tensors: HashMap<String, (Option<(Vec<usize>, Vec<f32>)>, Option<(Vec<usize>, Vec<f32>)>)> = HashMap::new();
+
     for (name, shape, dtype, data) in tensors {
         if let Some(stem) = name.strip_suffix(".weight_g") {
             weight_g.insert(stem.to_string(), (shape, decode_f32(dtype, &data)?));
         } else if let Some(stem) = name.strip_suffix(".weight_v") {
             weight_v.insert(stem.to_string(), (shape, decode_f32(dtype, &data)?));
+        } else if let Some(stem) = name.strip_suffix(".parametrizations.weight.original0") {
+            let entry = original_tensors.entry(stem.to_string()).or_insert((None, None));
+            entry.0 = Some((shape, decode_f32(dtype, &data)?));
+        } else if let Some(stem) = name.strip_suffix(".parametrizations.weight.original1") {
+            let entry = original_tensors.entry(stem.to_string()).or_insert((None, None));
+            entry.1 = Some((shape, decode_f32(dtype, &data)?));
         } else {
             plain.push((name, shape, dtype, data));
+        }
+    }
+
+    for (key, (orig0, orig1)) in original_tensors {
+        match (orig0, orig1) {
+            (Some(o0), Some(o1)) => {
+                let len0 = o0.1.len();
+                let len1 = o1.1.len();
+                if len0 >= len1 {
+                    weight_v.insert(key.clone(), o0);
+                    weight_g.insert(key, o1);
+                } else {
+                    weight_v.insert(key.clone(), o1);
+                    weight_g.insert(key, o0);
+                }
+            }
+            (Some(o0), None) => {
+                weight_v.insert(key, o0);
+            }
+            (None, Some(o1)) => {
+                weight_v.insert(key, o1);
+            }
+            (None, None) => {}
         }
     }
 
@@ -454,15 +492,9 @@ fn materialize_weight_norm(
     let mut out: HashMap<String, (Dtype, Vec<usize>, Vec<u8>)> = HashMap::new();
     for (name, shape, dtype, data) in plain {
         let Some(key) = translate(&name) else { continue };
-        // Convert source float dtype directly to target float dtype. burn-store
-        // does NOT auto-cast across dtypes (source bytes are handed straight to
-        // the target tensor), so we must match the backend dtype here. Direct
-        // single-pass conversion writes straight into the output Vec<u8>,
-        // skipping the intermediate Vec<f32> that decode_f32+encode_float
-        // would allocate (matters a lot for multi-GB models).
         let (dtype, data) = match dtype {
             Dtype::F32 | Dtype::F16 | Dtype::BF16 if dtype == target_float_dtype => {
-                (dtype, data) // already correct dtype, pass through
+                (dtype, data)
             }
             Dtype::F32 | Dtype::F16 | Dtype::BF16 => {
                 (target_float_dtype, convert_float_bytes(dtype, target_float_dtype, &data))
@@ -476,24 +508,53 @@ fn materialize_weight_norm(
         let (g_shape, g_data) = weight_g
             .remove(&stem)
             .ok_or_else(|| Error::MissingWeight(format!("{stem}.weight_g")))?;
-        let c_out = v_shape[0];
-        let inner: usize = v_shape.iter().skip(1).product();
-        if g_data.len() != c_out {
-            return Err(Error::ShapeMismatch {
-                name: format!("{stem}.weight_g"),
-                expected: vec![c_out],
-                actual: g_shape,
-            });
-        }
+
         let mut w = vec![0f32; v_data.len()];
-        for i in 0..c_out {
-            let off = i * inner;
-            let slice = &v_data[off..off + inner];
-            let norm_sq: f32 = slice.iter().map(|x| x * x).sum();
-            let norm = norm_sq.sqrt().max(1e-12);
-            let scale = g_data[i] / norm;
-            for j in 0..inner {
-                w[off + j] = slice[j] * scale;
+
+        // Check if normalized over last dimension (Case B: e.g. groups/positional embeddings)
+        let is_dim2_norm = v_shape.len() == 3 && g_shape.iter().take(g_shape.len() - 1).all(|&x| x == 1) && g_data.len() == v_shape[2];
+
+        if is_dim2_norm {
+            let d0 = v_shape[0];
+            let d1 = v_shape[1];
+            let d2 = v_shape[2];
+            for k in 0..d2 {
+                let mut sum_sq = 0.0f64;
+                for i in 0..d0 {
+                    for j in 0..d1 {
+                        let idx = (i * d1 + j) * d2 + k;
+                        let val = v_data[idx] as f64;
+                        sum_sq += val * val;
+                    }
+                }
+                let norm = sum_sq.sqrt().max(1e-12) as f32;
+                let scale = g_data[k] / norm;
+                for i in 0..d0 {
+                    for j in 0..d1 {
+                        let idx = (i * d1 + j) * d2 + k;
+                        w[idx] = v_data[idx] * scale;
+                    }
+                }
+            }
+        } else {
+            let c_out = v_shape[0];
+            let inner: usize = v_shape.iter().skip(1).product();
+            if g_data.len() != c_out {
+                return Err(Error::ShapeMismatch {
+                    name: format!("{stem}.weight_g"),
+                    expected: vec![c_out],
+                    actual: g_shape,
+                });
+            }
+            for i in 0..c_out {
+                let off = i * inner;
+                let slice = &v_data[off..off + inner];
+                let norm_sq: f32 = slice.iter().map(|x| x * x).sum();
+                let norm = norm_sq.sqrt().max(1e-12);
+                let scale = g_data[i] / norm;
+                for j in 0..inner {
+                    w[off + j] = slice[j] * scale;
+                }
             }
         }
         let bytes = encode_float(target_float_dtype, &w);
@@ -509,17 +570,16 @@ fn materialize_weight_norm(
         )));
     }
 
-    // Fuse Q/K/V projections. The Rust attention module uses a single
-    // `qkv_proj.weight` linear (fused along the output dim) to save kernel
-    // launches on GPU. Checkpoints store three separate tensors; stitch
     // them here post-remap/post-weight-norm so all sources (plain Python
     // safetensors, weight-norm materialized, etc.) land in the same map.
     //
     // `nn::Linear` weights in burn are `[out_features, in_features]`, so we
     // concat along dim 0 (row concat) in the order (q, k, v) to match the
     // `q_size + 2*kv_size` layout the attention forward expects.
-    fuse_qkv(&mut out)?;
-    fuse_gate_up(&mut out)?;
+    if fuse {
+        fuse_qkv(&mut out)?;
+        fuse_gate_up(&mut out)?;
+    }
 
     let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = out
         .iter()
@@ -839,3 +899,85 @@ impl Drop for SafetensorsFile {
         }
     }
 }
+
+/// Load pretrained weights for an [`crate::omnivoice::model::OmniVoiceModel`].
+pub fn load_omnivoice<B: Backend, M: ModuleSnapshot<B>>(
+    model: &mut M,
+    snapshot_dir: impl AsRef<Path>,
+) -> Result<ApplyResult> {
+    let dir = snapshot_dir.as_ref();
+    let target_dtype = target_float_dtype::<B>();
+
+    let model_st = dir.join("model.safetensors");
+    if model_st.exists() {
+        load_single(model, &model_st, None, Some(remap_omnivoice_key), target_dtype, true)
+    } else {
+        Err(Error::NotFound(format!(
+            "no model weights found in {} (expected model.safetensors)",
+            dir.display()
+        )))
+    }
+}
+
+/// Load pretrained weights for an [`crate::higgs::model::HiggsTokenizer`].
+pub fn load_higgs_tokenizer<B: Backend, M: ModuleSnapshot<B>>(
+    model: &mut M,
+    snapshot_dir: impl AsRef<Path>,
+) -> Result<ApplyResult> {
+    let dir = snapshot_dir.as_ref();
+    let target_dtype = target_float_dtype::<B>();
+
+    let model_st = dir.join("model.safetensors");
+    if model_st.exists() {
+        load_single(model, &model_st, None, Some(remap_higgs_key), target_dtype, false)
+    } else {
+        Err(Error::NotFound(format!(
+            "no tokenizer weights found in {} (expected model.safetensors)",
+            dir.display()
+        )))
+    }
+}
+
+fn remap_omnivoice_key(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("llm.model.") {
+        Some(format!("llm.{}", rest))
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn remap_higgs_key(name: &str) -> Option<String> {
+    if name.ends_with(".codebook.cluster_size")
+        || name.ends_with(".codebook.embed_avg")
+        || name.ends_with(".codebook.inited")
+    {
+        return None;
+    }
+
+    if let Some(rest) = name.strip_prefix("fc1.") {
+        return Some(format!("fc1.{}", rest));
+    }
+
+    if let Some(rest) = name.strip_prefix("semantic_model.feature_extractor.conv_layers.") {
+        let parts: Vec<&str> = rest.splitn(2, '.').collect();
+        let idx: usize = parts[0].parse().ok()?;
+        if idx == 0 {
+            let sub_key = parts[1].replace("layer_norm", "norm");
+            return Some(format!("semantic_model.feature_extractor.layer0.{}", sub_key));
+        } else {
+            return Some(format!("semantic_model.feature_extractor.layers.{}.{}", idx - 1, parts[1]));
+        }
+    }
+
+    if name.starts_with("decoder_semantic.conv_blocks.") {
+        if name.ends_with(".conv.weight") {
+            return Some(name.replace(".conv.weight", ".conv.Conv.weight"));
+        }
+        if name.ends_with(".conv.bias") {
+            return Some(name.replace(".conv.bias", ".conv.Conv.bias"));
+        }
+    }
+
+    Some(name.to_string())
+}
+

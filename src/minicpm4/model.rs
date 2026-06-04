@@ -44,6 +44,7 @@ impl<B: Backend> MiniCpmModel<B> {
         &self,
         inputs_embeds: Tensor<B, 3>,
         is_causal: bool,
+        attn_mask: Option<Tensor<B, 4, burn::tensor::Bool>>,
     ) -> (Tensor<B, 3>, Vec<LayerKv<B>>) {
         let s = inputs_embeds.dims()[1];
         let position_emb = self.rope.as_ref().map(|r| {
@@ -54,7 +55,7 @@ impl<B: Backend> MiniCpmModel<B> {
         let mut hidden = inputs_embeds;
         let mut caches = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let (h, kv) = layer.forward(hidden, position_emb.clone(), is_causal);
+            let (h, kv) = layer.forward(hidden, position_emb.clone(), is_causal, attn_mask.clone());
             hidden = h;
             caches.push(kv);
         }

@@ -2,6 +2,7 @@
 
 use crate::config::MiniCpm4Config;
 use crate::minicpm4::rope::apply_rotary_pos_emb;
+use crate::minicpm4::MiniCpmRmsNorm;
 use burn::nn::{Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::activation::softmax;
@@ -28,6 +29,8 @@ pub struct MiniCpmAttention<B: Backend> {
     /// Cached split offsets for narrowing the fused qkv output.
     pub q_size: usize,  // num_heads * head_dim
     pub kv_size: usize, // num_kv_heads * head_dim
+    pub q_norm: Option<MiniCpmRmsNorm<B>>,
+    pub k_norm: Option<MiniCpmRmsNorm<B>>,
 }
 
 impl<B: Backend> MiniCpmAttention<B> {
@@ -42,11 +45,16 @@ impl<B: Backend> MiniCpmAttention<B> {
         let qkv_proj = LinearConfig::new(hidden, q_size + 2 * kv_size).with_bias(false).init(device);
         let o_proj = LinearConfig::new(q_size, hidden).with_bias(false).init(device);
 
+        let use_q_norm = config.model_type.as_deref() == Some("qwen3");
+        let q_norm = use_q_norm.then(|| MiniCpmRmsNorm::new(head_dim, config.rms_norm_eps as f64, device));
+        let k_norm = use_q_norm.then(|| MiniCpmRmsNorm::new(head_dim, config.rms_norm_eps as f64, device));
+
         Self {
             qkv_proj, o_proj,
             num_heads, num_kv_heads, head_dim,
             scale: 1.0 / (head_dim as f64).sqrt(),
             q_size, kv_size,
+            q_norm, k_norm,
         }
     }
 
@@ -57,6 +65,7 @@ impl<B: Backend> MiniCpmAttention<B> {
         hidden_states: Tensor<B, 3>,
         position_emb: Option<(Tensor<B, 2>, Tensor<B, 2>)>,
         is_causal: bool,
+        attn_mask: Option<Tensor<B, 4, burn::tensor::Bool>>,
     ) -> (Tensor<B, 3>, LayerKv<B>) {
         let [bsz, q_len, _] = hidden_states.dims();
 
@@ -70,6 +79,14 @@ impl<B: Backend> MiniCpmAttention<B> {
         let k = k.reshape([bsz, q_len, self.num_kv_heads, self.head_dim]).swap_dims(1, 2);
         let v = v.reshape([bsz, q_len, self.num_kv_heads, self.head_dim]).swap_dims(1, 2);
 
+        let (q, k) = if let Some(ref q_norm) = self.q_norm {
+            let q_normed = q_norm.forward(q);
+            let k_normed = self.k_norm.as_ref().unwrap().forward(k);
+            (q_normed, k_normed)
+        } else {
+            (q, k)
+        };
+
         let (q, k) = if let Some((cos, sin)) = position_emb {
             apply_rotary_pos_emb(q, k, cos, sin)
         } else {
@@ -80,7 +97,7 @@ impl<B: Backend> MiniCpmAttention<B> {
         let k_full = repeat_kv(k.clone(), n_rep);
         let v_full = repeat_kv(v.clone(), n_rep);
 
-        let attn = self.sdpa(q, k_full, v_full, is_causal, None);
+        let attn = self.sdpa(q, k_full, v_full, is_causal, attn_mask);
 
         let attn = attn.swap_dims(1, 2).reshape([bsz, q_len, self.num_heads * self.head_dim]);
         let out = self.o_proj.forward(attn);
@@ -114,6 +131,14 @@ impl<B: Backend> MiniCpmAttention<B> {
         let q: Tensor<B, 4> = q.reshape([bsz, 1, self.num_heads, self.head_dim]).swap_dims(1, 2);
         let k: Tensor<B, 4> = k.reshape([bsz, 1, self.num_kv_heads, self.head_dim]).swap_dims(1, 2);
         let v: Tensor<B, 4> = v.reshape([bsz, 1, self.num_kv_heads, self.head_dim]).swap_dims(1, 2);
+
+        let (q, k) = if let Some(ref q_norm) = self.q_norm {
+            let q_normed = q_norm.forward(q);
+            let k_normed = self.k_norm.as_ref().unwrap().forward(k);
+            (q_normed, k_normed)
+        } else {
+            (q, k)
+        };
 
         let (q, k) = if let Some((cos, sin)) = position_emb {
             apply_rotary_pos_emb(q, k, cos, sin)

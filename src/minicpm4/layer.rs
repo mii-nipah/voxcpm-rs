@@ -42,10 +42,11 @@ impl<B: Backend> MiniCpmDecoderLayer<B> {
         hidden_states: Tensor<B, 3>,
         position_emb: Option<(Tensor<B, 2>, Tensor<B, 2>)>,
         is_causal: bool,
+        attn_mask: Option<Tensor<B, 4, burn::tensor::Bool>>,
     ) -> (Tensor<B, 3>, LayerKv<B>) {
         let residual = hidden_states.clone();
         let h = self.input_layernorm.forward(hidden_states);
-        let (h, kv) = self.self_attn.forward(h, position_emb, is_causal);
+        let (h, kv) = self.self_attn.forward(h, position_emb, is_causal, attn_mask);
         let h = self.add_residual(residual, h);
 
         let residual = h.clone();

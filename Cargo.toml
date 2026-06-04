@@ -64,6 +64,7 @@ half = "2"
 log = "0.4"
 bytemuck = "1"
 memmap2 = "0.9"
+unicode-general-category = "0.6"
 
 [dev-dependencies]
 approx = "0.5"

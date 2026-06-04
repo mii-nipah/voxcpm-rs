@@ -41,9 +41,11 @@ pub mod audiovae;
 pub mod config;
 pub mod error;
 pub mod fsq;
+pub mod higgs;
 pub mod locdit;
 pub mod locenc;
 pub mod minicpm4;
+pub mod omnivoice;
 pub mod tokenizer;
 pub mod voxcpm2;
 pub mod weights;
@@ -58,3 +60,8 @@ pub use voxcpm2::{
     CancelToken, GenerateOptions, GenerateOptionsBuilder, GenerateStream, Prompt, PromptAudio,
     VoxCPM,
 };
+pub use omnivoice::{
+    OmniVoice, OmniVoicePrompt, OmniVoiceOptions, OmniVoiceOptionsBuilder, OmniVoiceConfig,
+    OmniVoiceGenerationConfig, OmniVoiceModel,
+};
+pub use higgs::model::HiggsTokenizer;

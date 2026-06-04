@@ -1,4 +1,5 @@
 .vscode
+.venv
 /target
 vendor/VoxCPM/
 vendor/burn/

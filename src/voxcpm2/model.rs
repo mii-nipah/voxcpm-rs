@@ -176,7 +176,7 @@ impl<B: Backend> VoxCpm2Model<B> {
         let prefix_feat: Tensor<B, 3> = feat.clone().narrow(1, s - 1, 1).squeeze_dim::<3>(1); // [B, P, D]
 
         // 5) Base LM prefill.
-        let (enc_outputs, base_kv) = self.base_lm.forward(combined, true);
+        let (enc_outputs, base_kv) = self.base_lm.forward(combined, true, None);
         let enc_outputs = self.fsq_layer.forward(enc_outputs.clone()) * feat_mask3.clone()
             + enc_outputs * text_mask3;
         let lm_hidden_prefill = enc_outputs.clone();
@@ -186,7 +186,7 @@ impl<B: Backend> VoxCpm2Model<B> {
             vec![enc_outputs, feat_embed.clone() * feat_mask3],
             2,
         ));
-        let (residual_outputs, residual_kv) = self.residual_lm.forward(residual_input, true);
+        let (residual_outputs, residual_kv) = self.residual_lm.forward(residual_input, true, None);
 
         // Seed caches with the prefill K/V.
         let s_ctx = lm_hidden_prefill.dims()[1];
