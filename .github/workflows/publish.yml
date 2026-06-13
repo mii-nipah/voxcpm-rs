@@ -1,37 +1,33 @@
 name: Publish to crates.io
 
-# Triggers when you push a tag like `v0.1.1` (matches the crate version).
-# Manual runs are also allowed from the Actions tab via workflow_dispatch.
+# Triggers when an authorized user pushes a protected tag like `v0.1.1`
+# (matches the crate version). The tagged commit must already be present on
+# the repository's default branch.
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 jobs:
   publish:
     name: cargo publish
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && github.ref_protected
     # Hardening: only this job needs the token, and it doesn't need write
     # access to the repo itself.
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Verify tag matches Cargo.toml version
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Verify release ref
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
           manifest_version="$(cargo metadata --no-deps --format-version 1 \
@@ -41,6 +37,21 @@ jobs:
             echo "::error::Tag v$tag_version does not match Cargo.toml version $manifest_version"
             exit 1
           fi
+
+          default_branch="${{ github.event.repository.default_branch }}"
+          git fetch --no-tags origin "+refs/heads/${default_branch}:refs/remotes/origin/${default_branch}"
+          if ! git merge-base --is-ancestor HEAD "refs/remotes/origin/${default_branch}"; then
+            echo "::error::Release tag must point to a commit already reachable from ${default_branch}"
+            exit 1
+          fi
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Publish
         env:
