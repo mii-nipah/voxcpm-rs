@@ -33,17 +33,25 @@ jobs:
         id: format
         continue-on-error: true
         run: |
-          rustfmt --edition 2024 --emit stdout src/weights.rs > /tmp/weights.rs
-          diff -u src/weights.rs /tmp/weights.rs
+          mkdir -p /tmp/formatted
+          status=0
+          for file in src/weights.rs tests/checkpoint_memory.rs; do
+            rustfmt --edition 2024 --emit stdout < "$file" > "/tmp/formatted/$(basename "$file")"
+            diff -u "$file" "/tmp/formatted/$(basename "$file")" || status=1
+          done
+          exit "$status"
       - uses: actions/upload-artifact@v4
         if: steps.format.outcome == 'failure'
         with:
           name: formatted-weights
-          path: /tmp/weights.rs
+          path: /tmp/formatted/
       - name: CPU tests
-        run: cargo test --locked --no-default-features --features cpu
+        run: |
+          cargo test --locked --no-default-features --features cpu --lib
+          cargo test --locked --no-default-features --features cpu --test checkpoint_memory -- --nocapture
+          cargo test --locked --no-default-features --features cpu --doc
       - name: Clippy
-        run: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --lib --tests
       - name: Require formatting
         if: steps.format.outcome == 'failure'
         run: exit 1

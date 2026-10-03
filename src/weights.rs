@@ -125,7 +125,9 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     // the final report shows only params that were truly never loaded.
     let applied_set: std::collections::HashSet<&str> =
         result.applied.iter().map(|s| s.as_str()).collect();
-    result.missing.retain(|(path, _)| !applied_set.contains(path.as_str()));
+    result
+        .missing
+        .retain(|(path, _)| !applied_set.contains(path.as_str()));
     // While we're at it, dedupe the missing list itself (a param may be
     // reported missing by every file).
     let mut seen = std::collections::HashSet::new();
@@ -281,8 +283,12 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     // copies metadata only; source bytes are read when the module asks for
     // each parameter, and the mmap stays alive until application finishes.
     let mut store = SafetensorsStore::from_file(path);
-    let tensors = store.get_all_snapshots().map_err(map_store_err)?
-        .iter().map(|(name, snapshot)| (name.clone(), snapshot.clone())).collect();
+    let tensors = store
+        .get_all_snapshots()
+        .map_err(map_store_err)?
+        .iter()
+        .map(|(name, snapshot)| (name.clone(), snapshot.clone()))
+        .collect();
     prepare_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
 }
 
@@ -299,13 +305,16 @@ fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
 
     let reader = PytorchReader::new(path)
         .map_err(|e| Error::Other(format!("read pytorch file `{}`: {e}", path.display())))?;
-    let tensors = reader.tensors().iter().map(|(name, snapshot)| {
-        (strip_pth_top_level(name).to_string(), snapshot.clone())
-    }).collect();
+    let tensors = reader
+        .tensors()
+        .iter()
+        .map(|(name, snapshot)| (strip_pth_top_level(name).to_string(), snapshot.clone()))
+        .collect();
     prepare_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
 }
 
-fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {    use burn::tensor::DType as B;
+fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {
+    use burn::tensor::DType as B;
     Ok(match dt {
         B::F64 => Dtype::F64,
         B::F32 | B::Flex32 => Dtype::F32,
@@ -339,11 +348,15 @@ fn prepare_and_apply<B: Backend, M: ModuleSnapshot<B>>(
     let t0 = std::time::Instant::now();
     let snapshots = prepare_snapshots(tensors, prefix, remap, target_float_dtype)?;
     let result = model.apply(snapshots, None, Some(Box::new(PyTorchToBurnAdapter)), false);
-    log::debug!("weights[{}] lazy load+apply: {:.2?}", path.display(), t0.elapsed());
+    log::debug!(
+        "weights[{}] lazy load+apply: {:.2?}",
+        path.display(),
+        t0.elapsed()
+    );
     if !result.errors.is_empty() {
-        return Err(map_store_err(SafetensorsStoreError::ValidationFailed(format!(
-            "Import errors: {:?}", result.errors
-        ))));
+        return Err(map_store_err(SafetensorsStoreError::ValidationFailed(
+            format!("Import errors: {:?}", result.errors),
+        )));
     }
     Ok(result)
 }
@@ -383,38 +396,67 @@ fn prepare_snapshots(
     };
     // Check actual lazy reads against metadata, including PyTorch's backing
     // storage. A malformed source must not be reinterpreted as another dtype.
-    tensors = tensors.into_iter().map(|(name, snapshot)| {
-        let source = snapshot.clone_data_fn();
-        let dtype = snapshot.dtype;
-        let shape = snapshot.shape.clone();
-        let expected_len = snapshot.data_len();
-        let path = name.clone();
-        let checked = TensorSnapshot::from_closure(Rc::new(move || {
-            let data = source()?;
-            if data.dtype != dtype || data.shape != shape || data.as_bytes().len() != expected_len {
-                return Err(TensorSnapshotError::DataError(format!("tensor data disagrees with metadata for {path}")));
-            }
-            Ok(data)
-        }), dtype, snapshot.shape, snapshot.path_stack.unwrap_or_default(), vec![], Default::default());
-        (name, checked)
-    }).collect();
-    let v_keys: Vec<_> = tensors.keys().filter(|k| k.ends_with(".weight_v")).cloned().collect();
+    tensors = tensors
+        .into_iter()
+        .map(|(name, snapshot)| {
+            let source = snapshot.clone_data_fn();
+            let dtype = snapshot.dtype;
+            let shape = snapshot.shape.clone();
+            let expected_len = snapshot.data_len();
+            let path = name.clone();
+            let checked = TensorSnapshot::from_closure(
+                Rc::new(move || {
+                    let data = source()?;
+                    if data.dtype != dtype
+                        || data.shape != shape
+                        || data.as_bytes().len() != expected_len
+                    {
+                        return Err(TensorSnapshotError::DataError(format!(
+                            "tensor data disagrees with metadata for {path}"
+                        )));
+                    }
+                    Ok(data)
+                }),
+                dtype,
+                snapshot.shape,
+                snapshot.path_stack.unwrap_or_default(),
+                vec![],
+                Default::default(),
+            );
+            (name, checked)
+        })
+        .collect();
+    let v_keys: Vec<_> = tensors
+        .keys()
+        .filter(|k| k.ends_with(".weight_v"))
+        .cloned()
+        .collect();
     for v_key in v_keys {
         let stem = v_key.strip_suffix(".weight_v").unwrap();
         let v = tensors.remove(&v_key).unwrap();
         let g_key = format!("{stem}.weight_g");
-        let g = tensors.remove(&g_key).ok_or_else(|| Error::MissingWeight(g_key.clone()))?;
+        let g = tensors
+            .remove(&g_key)
+            .ok_or_else(|| Error::MissingWeight(g_key.clone()))?;
         let Some(&c_out) = v.shape.first() else {
-            return Err(Error::Other(format!("weight_norm expects a non-scalar tensor at {stem}")));
+            return Err(Error::Other(format!(
+                "weight_norm expects a non-scalar tensor at {stem}"
+            )));
         };
         if g.shape.iter().product::<usize>() != c_out {
-            return Err(Error::ShapeMismatch { name: g_key, expected: vec![c_out], actual: g.shape });
+            return Err(Error::ShapeMismatch {
+                name: g_key,
+                expected: vec![c_out],
+                actual: g.shape,
+            });
         }
         let v_dtype = burn_dtype_to_safetensors(v.dtype)?;
         let g_dtype = burn_dtype_to_safetensors(g.dtype)?;
         for dtype in [v_dtype, g_dtype] {
             if !matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) {
-                return Err(Error::Unsupported(format!("safetensors dtype {dtype:?} for weight_norm tensor")));
+                return Err(Error::Unsupported(format!(
+                    "safetensors dtype {dtype:?} for weight_norm tensor"
+                )));
             }
         }
         let shape = v.shape.clone();
@@ -433,12 +475,24 @@ fn prepare_snapshots(
                     w[off + j] = slice[j] * scale;
                 }
             }
-            Ok(tensor_data(encode_float(target_float_dtype, &w), data_shape.clone(), target_dtype))
+            Ok(tensor_data(
+                encode_float(target_float_dtype, &w),
+                data_shape.clone(),
+                target_dtype,
+            ))
         });
         let key = format!("{stem}.weight");
-        tensors.insert(key.clone(), TensorSnapshot::from_closure(
-            data_fn, target_dtype, shape, key.split('.').map(str::to_owned).collect(), vec![], Default::default(),
-        ));
+        tensors.insert(
+            key.clone(),
+            TensorSnapshot::from_closure(
+                data_fn,
+                target_dtype,
+                shape,
+                key.split('.').map(str::to_owned).collect(),
+                vec![],
+                Default::default(),
+            ),
+        );
     }
     if let Some(key) = tensors.keys().find(|k| k.ends_with(".weight_g")) {
         return Err(Error::Other(format!("weight_g without weight_v: {key}")));
@@ -447,7 +501,10 @@ fn prepare_snapshots(
     let mut out = HashMap::new();
     for (name, mut snapshot) in tensors {
         let mapped = match remap {
-            Some(f) => match f(&name) { Some(mapped) => mapped, None => continue },
+            Some(f) => match f(&name) {
+                Some(mapped) => mapped,
+                None => continue,
+            },
             None => name,
         };
         let key = format!("{}{mapped}", prefix.unwrap_or_default());
@@ -458,10 +515,19 @@ fn prepare_snapshots(
             let shape = snapshot.shape.clone();
             let data_fn = Rc::new(move || {
                 let data = source()?;
-                Ok(tensor_data(convert_float_bytes(dtype, target_float_dtype, data.as_bytes()), shape.clone(), target_dtype))
+                Ok(tensor_data(
+                    convert_float_bytes(dtype, target_float_dtype, data.as_bytes()),
+                    shape.clone(),
+                    target_dtype,
+                ))
             });
             snapshot = TensorSnapshot::from_closure(
-                data_fn, target_dtype, snapshot.shape, snapshot.path_stack.unwrap(), vec![], Default::default(),
+                data_fn,
+                target_dtype,
+                snapshot.shape,
+                snapshot.path_stack.unwrap(),
+                vec![],
+                Default::default(),
             );
         }
         out.insert(key, snapshot);
@@ -476,7 +542,11 @@ fn snapshot_error(error: Error) -> TensorSnapshotError {
 }
 
 fn tensor_data(bytes: Vec<u8>, shape: Vec<usize>, dtype: DType) -> TensorData {
-    TensorData { bytes: Bytes::from_bytes_vec(bytes), shape, dtype }
+    TensorData {
+        bytes: Bytes::from_bytes_vec(bytes),
+        shape,
+        dtype,
+    }
 }
 
 fn decode_f32(dtype: Dtype, data: &[u8]) -> Result<Vec<f32>> {
@@ -589,17 +659,36 @@ fn fuse_projections(
     equal_rows: bool,
 ) -> Result<()> {
     let suffix = format!(".{}.weight", projections[0]);
-    let first_keys: Vec<_> = tensors.keys().filter(|k| k.ends_with(&suffix)).cloned().collect();
+    let first_keys: Vec<_> = tensors
+        .keys()
+        .filter(|k| k.ends_with(&suffix))
+        .cloned()
+        .collect();
     for first_key in first_keys {
         let stem = first_key.strip_suffix(&suffix).unwrap();
-        let keys: Vec<_> = projections.iter().map(|p| format!("{stem}.{p}.weight")).collect();
+        let keys: Vec<_> = projections
+            .iter()
+            .map(|p| format!("{stem}.{p}.weight"))
+            .collect();
         // Preserve unrelated/incomplete projection groups as individual tensors.
-        if !keys.iter().all(|key| tensors.contains_key(key)) { continue; }
-        let sources: Vec<_> = keys.iter().map(|key| tensors.remove(key).unwrap()).collect();
+        if !keys.iter().all(|key| tensors.contains_key(key)) {
+            continue;
+        }
+        let sources: Vec<_> = keys
+            .iter()
+            .map(|key| tensors.remove(key).unwrap())
+            .collect();
         let first = &sources[0];
-        if sources.iter().any(|s| s.dtype != first.dtype || s.shape.len() != 2)
-            || sources.iter().any(|s| s.shape[1] != first.shape[1] || (equal_rows && s.shape[0] != first.shape[0])) {
-            return Err(Error::Other(format!("{fused_name} fusion dtype/shape mismatch at {stem}")));
+        if sources
+            .iter()
+            .any(|s| s.dtype != first.dtype || s.shape.len() != 2)
+            || sources.iter().any(|s| {
+                s.shape[1] != first.shape[1] || (equal_rows && s.shape[0] != first.shape[0])
+            })
+        {
+            return Err(Error::Other(format!(
+                "{fused_name} fusion dtype/shape mismatch at {stem}"
+            )));
         }
         let dtype = first.dtype;
         let shape = vec![sources.iter().map(|s| s.shape[0]).sum(), first.shape[1]];
@@ -613,9 +702,17 @@ fn fuse_projections(
             Ok(tensor_data(bytes, data_shape.clone(), dtype))
         });
         let key = format!("{stem}.{fused_name}.weight");
-        tensors.insert(key.clone(), TensorSnapshot::from_closure(
-            data_fn, dtype, shape, key.split('.').map(str::to_owned).collect(), vec![], Default::default(),
-        ));
+        tensors.insert(
+            key.clone(),
+            TensorSnapshot::from_closure(
+                data_fn,
+                dtype,
+                shape,
+                key.split('.').map(str::to_owned).collect(),
+                vec![],
+                Default::default(),
+            ),
+        );
     }
     Ok(())
 }
@@ -704,8 +801,16 @@ mod tests {
     }
 
     fn prepare(sources: Vec<TensorSnapshot>, dtype: Dtype) -> HashMap<String, TensorSnapshot> {
-        prepare_snapshots(sources.into_iter().map(|s| (s.full_path(), s)).collect(), None, None, dtype)
-            .unwrap().into_iter().map(|s| (s.full_path(), s)).collect()
+        prepare_snapshots(
+            sources.into_iter().map(|s| (s.full_path(), s)).collect(),
+            None,
+            None,
+            dtype,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.full_path(), s))
+        .collect()
     }
 
     #[test]
@@ -716,14 +821,24 @@ mod tests {
                 let counter = calls.clone();
                 let source = snapshot("weight", &[4], &[0., -2., 0.5, 16.], source_dtype);
                 let s = TensorSnapshot::from_closure(
-                    Rc::new(move || { counter.set(counter.get() + 1); source.to_data() }),
-                    source_dtype, vec![4], vec!["weight".into()], vec![], Default::default(),
+                    Rc::new(move || {
+                        counter.set(counter.get() + 1);
+                        source.to_data()
+                    }),
+                    source_dtype,
+                    vec![4],
+                    vec!["weight".into()],
+                    vec![],
+                    Default::default(),
                 );
                 let out = prepare(vec![s], target_dtype);
                 assert_eq!(calls.get(), 0, "preparation must never read tensor bytes");
                 let data = out["weight"].to_data().unwrap();
                 assert_eq!(burn_dtype_to_safetensors(data.dtype).unwrap(), target_dtype);
-                assert_eq!(decode_f32(target_dtype, data.as_bytes()).unwrap(), vec![0., -2., 0.5, 16.]);
+                assert_eq!(
+                    decode_f32(target_dtype, data.as_bytes()).unwrap(),
+                    vec![0., -2., 0.5, 16.]
+                );
                 assert_eq!(calls.get(), 1);
             }
         }
@@ -731,63 +846,127 @@ mod tests {
 
     #[test]
     fn fuses_qkv_and_gate_up_in_checkpoint_row_order() {
-        let out = prepare(vec![
-            snapshot("attn.v_proj.weight", &[1, 2], &[7., 8.], DType::BF16),
-            snapshot("mlp.up_proj.weight", &[1, 2], &[11., 12.], DType::F16),
-            snapshot("attn.q_proj.weight", &[2, 2], &[1., 2., 3., 4.], DType::BF16),
-            snapshot("attn.k_proj.weight", &[1, 2], &[5., 6.], DType::BF16),
-            snapshot("mlp.gate_proj.weight", &[1, 2], &[9., 10.], DType::F16),
-        ], Dtype::F32);
+        let out = prepare(
+            vec![
+                snapshot("attn.v_proj.weight", &[1, 2], &[7., 8.], DType::BF16),
+                snapshot("mlp.up_proj.weight", &[1, 2], &[11., 12.], DType::F16),
+                snapshot(
+                    "attn.q_proj.weight",
+                    &[2, 2],
+                    &[1., 2., 3., 4.],
+                    DType::BF16,
+                ),
+                snapshot("attn.k_proj.weight", &[1, 2], &[5., 6.], DType::BF16),
+                snapshot("mlp.gate_proj.weight", &[1, 2], &[9., 10.], DType::F16),
+            ],
+            Dtype::F32,
+        );
         assert_eq!(out.len(), 2);
         let qkv = out["attn.qkv_proj.weight"].to_data().unwrap();
         assert_eq!(qkv.shape, vec![4, 2]);
-        assert_eq!(qkv.to_vec::<f32>().unwrap(), vec![1., 2., 3., 4., 5., 6., 7., 8.]);
-        assert_eq!(out["mlp.gate_up_proj.weight"].to_data().unwrap().to_vec::<f32>().unwrap(), vec![9., 10., 11., 12.]);
+        assert_eq!(
+            qkv.to_vec::<f32>().unwrap(),
+            vec![1., 2., 3., 4., 5., 6., 7., 8.]
+        );
+        assert_eq!(
+            out["mlp.gate_up_proj.weight"]
+                .to_data()
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap(),
+            vec![9., 10., 11., 12.]
+        );
     }
 
     #[test]
     fn materializes_weight_norm_and_remaps_audio_vae() {
         let sources = [
-            snapshot("decoder.model.0.weight_v", &[2, 1, 2], &[3., 4., 0., 0.], DType::F32),
-            snapshot("decoder.model.0.weight_g", &[2, 1, 1], &[10., 2.], DType::F32),
+            snapshot(
+                "decoder.model.0.weight_v",
+                &[2, 1, 2],
+                &[3., 4., 0., 0.],
+                DType::F32,
+            ),
+            snapshot(
+                "decoder.model.0.weight_g",
+                &[2, 1, 1],
+                &[10., 2.],
+                DType::F32,
+            ),
             snapshot("decoder.sr_bin_boundaries", &[1], &[42.], DType::F32),
         ];
-        let out = prepare_snapshots(sources.into_iter().map(|s| (s.full_path(), s)).collect(),
-            Some("audio_vae."), Some(remap_audiovae_key), Dtype::BF16).unwrap();
+        let out = prepare_snapshots(
+            sources.into_iter().map(|s| (s.full_path(), s)).collect(),
+            Some("audio_vae."),
+            Some(remap_audiovae_key),
+            Dtype::BF16,
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].full_path(), "audio_vae.decoder.first.dw.conv.weight");
         let data = out[0].to_data().unwrap();
         assert_eq!(data.shape, vec![2, 1, 2]);
-        assert_eq!(decode_f32(Dtype::BF16, data.as_bytes()).unwrap(), vec![6., 8., 0., 0.]);
+        assert_eq!(
+            decode_f32(Dtype::BF16, data.as_bytes()).unwrap(),
+            vec![6., 8., 0., 0.]
+        );
     }
 
     #[test]
     fn rejects_orphan_norm_weights_and_incompatible_fusion() {
         for name in ["conv.weight_v", "conv.weight_g"] {
             let s = snapshot(name, &[1], &[1.], DType::F32);
-            assert!(prepare_snapshots([(name.to_string(), s)].into(), None, None, Dtype::F32).is_err());
+            assert!(
+                prepare_snapshots([(name.to_string(), s)].into(), None, None, Dtype::F32).is_err()
+            );
         }
         for (shape, values) in [(vec![], vec![1.]), (vec![2, 1], vec![1., 2.])] {
-            let sources = [snapshot("mlp.gate_proj.weight", &[1, 1], &[1.], DType::F32),
-                snapshot("mlp.up_proj.weight", &shape, &values, DType::F32)];
-            assert!(prepare_snapshots(sources.into_iter().map(|s| (s.full_path(), s)).collect(), None, None, Dtype::F32).is_err());
+            let sources = [
+                snapshot("mlp.gate_proj.weight", &[1, 1], &[1.], DType::F32),
+                snapshot("mlp.up_proj.weight", &shape, &values, DType::F32),
+            ];
+            assert!(
+                prepare_snapshots(
+                    sources.into_iter().map(|s| (s.full_path(), s)).collect(),
+                    None,
+                    None,
+                    Dtype::F32
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn incomplete_projection_groups_and_integer_buffers_are_preserved() {
-        let int = TensorSnapshot::from_data(TensorData::new(vec![1i64, 2], [2]),
-            vec!["positions".into()], vec![], Default::default());
-        let out = prepare(vec![int, snapshot("attn.q_proj.weight", &[1, 2], &[1., 2.], DType::F32)], Dtype::F16);
+        let int = TensorSnapshot::from_data(
+            TensorData::new(vec![1i64, 2], [2]),
+            vec!["positions".into()],
+            vec![],
+            Default::default(),
+        );
+        let out = prepare(
+            vec![
+                int,
+                snapshot("attn.q_proj.weight", &[1, 2], &[1., 2.], DType::F32),
+            ],
+            Dtype::F16,
+        );
         assert_eq!(out.len(), 2);
         assert!(out.contains_key("attn.q_proj.weight"));
-        assert_eq!(out["positions"].to_data().unwrap().to_vec::<i64>().unwrap(), vec![1, 2]);
+        assert_eq!(
+            out["positions"].to_data().unwrap().to_vec::<i64>().unwrap(),
+            vec![1, 2]
+        );
     }
 
     #[test]
     fn strips_pytorch_container_prefixes() {
         for prefix in ["state_dict.", "model_state_dict.", "module.", ""] {
-            assert_eq!(strip_pth_top_level(&format!("{prefix}layer.weight")), "layer.weight");
+            assert_eq!(
+                strip_pth_top_level(&format!("{prefix}layer.weight")),
+                "layer.weight"
+            );
         }
     }
 
@@ -795,12 +974,19 @@ mod tests {
     impl TempCheckpoint {
         fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let path = std::env::temp_dir().join(format!("voxcpm-weights-{}-{}.safetensors", std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let path = std::env::temp_dir().join(format!(
+                "voxcpm-weights-{}-{}.safetensors",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             Self(path)
         }
     }
-    impl Drop for TempCheckpoint { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+    impl Drop for TempCheckpoint {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     #[test]
     fn file_snapshots_keep_their_mmap_alive_after_store_drop() {
@@ -810,10 +996,18 @@ mod tests {
         safetensors::serialize_to_file([("weight", view)], &None, &file.0).unwrap();
         let sources = {
             let mut store = SafetensorsStore::from_file(&file.0);
-            store.get_all_snapshots().unwrap().iter().map(|(k, s)| (k.clone(), s.clone())).collect()
+            store
+                .get_all_snapshots()
+                .unwrap()
+                .iter()
+                .map(|(k, s)| (k.clone(), s.clone()))
+                .collect()
         };
         let snapshots = prepare_snapshots(sources, None, None, Dtype::F32).unwrap();
-        assert_eq!(snapshots[0].to_data().unwrap().to_vec::<f32>().unwrap(), vec![1., 2., 3., 4.]);
+        assert_eq!(
+            snapshots[0].to_data().unwrap().to_vec::<f32>().unwrap(),
+            vec![1., 2., 3., 4.]
+        );
     }
 
     #[cfg(feature = "cpu")]
@@ -824,7 +1018,9 @@ mod tests {
     }
     #[cfg(feature = "cpu")]
     #[derive(Module, Debug)]
-    struct AttentionModule<B: Backend> { qkv_proj: burn::nn::Linear<B> }
+    struct AttentionModule<B: Backend> {
+        qkv_proj: burn::nn::Linear<B>,
+    }
 
     #[test]
     #[cfg(feature = "cpu")]
@@ -832,25 +1028,58 @@ mod tests {
         type B = burn::backend::NdArray<f32>;
         let device = Default::default();
         let mut model = ProjectionModule::<B> {
-            attn: AttentionModule { qkv_proj: burn::nn::LinearConfig::new(2, 4).with_bias(false).init(&device) },
-            untouched: burn::nn::LinearConfig::new(2, 2).with_bias(false).init(&device),
+            attn: AttentionModule {
+                qkv_proj: burn::nn::LinearConfig::new(2, 4)
+                    .with_bias(false)
+                    .init(&device),
+            },
+            untouched: burn::nn::LinearConfig::new(2, 2)
+                .with_bias(false)
+                .init(&device),
         };
-        let unread = TensorSnapshot::from_closure(Rc::new(|| panic!("unused tensor must remain lazy")),
-            DType::F32, vec![1], vec!["unused".into()], vec![], Default::default());
+        let unread = TensorSnapshot::from_closure(
+            Rc::new(|| panic!("unused tensor must remain lazy")),
+            DType::F32,
+            vec![1],
+            vec!["unused".into()],
+            vec![],
+            Default::default(),
+        );
         let sources = [
-            snapshot("attn.q_proj.weight", &[2, 2], &[1., 2., 3., 4.], DType::BF16),
+            snapshot(
+                "attn.q_proj.weight",
+                &[2, 2],
+                &[1., 2., 3., 4.],
+                DType::BF16,
+            ),
             snapshot("attn.k_proj.weight", &[1, 2], &[5., 6.], DType::BF16),
-            snapshot("attn.v_proj.weight", &[1, 2], &[7., 8.], DType::BF16), unread,
+            snapshot("attn.v_proj.weight", &[1, 2], &[7., 8.], DType::BF16),
+            unread,
         ];
-        let result = prepare_and_apply(&mut model, Path::new("synthetic"),
-            sources.into_iter().map(|s| (s.full_path(), s)).collect(), None, None, Dtype::F32).unwrap();
+        let result = prepare_and_apply(
+            &mut model,
+            Path::new("synthetic"),
+            sources.into_iter().map(|s| (s.full_path(), s)).collect(),
+            None,
+            None,
+            Dtype::F32,
+        )
+        .unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(result.applied, vec!["attn.qkv_proj.weight"]);
-        assert!(result.missing.iter().any(|(key, _)| key == "untouched.weight"));
+        assert!(
+            result
+                .missing
+                .iter()
+                .any(|(key, _)| key == "untouched.weight")
+        );
         assert_eq!(result.unused, vec!["unused"]);
         let data = model.attn.qkv_proj.weight.val().to_data();
         assert_eq!(data.shape, vec![2, 4]);
-        assert_eq!(data.to_vec::<f32>().unwrap(), vec![1., 3., 5., 7., 2., 4., 6., 8.]);
+        assert_eq!(
+            data.to_vec::<f32>().unwrap(),
+            vec![1., 3., 5., 7., 2., 4., 6., 8.]
+        );
     }
 
     #[test]
@@ -858,24 +1087,64 @@ mod tests {
     fn apply_rejects_shape_mismatches_and_deferred_read_errors() {
         type B = burn::backend::NdArray<f32>;
         for malformed_shape in [true, false] {
-            let mut model = burn::nn::LinearConfig::new(2, 2).with_bias(false).init::<B>(&Default::default());
+            let mut model = burn::nn::LinearConfig::new(2, 2)
+                .with_bias(false)
+                .init::<B>(&Default::default());
             let source = if malformed_shape {
                 snapshot("weight", &[1, 2], &[1., 2.], DType::F32)
             } else {
-                TensorSnapshot::from_closure(Rc::new(|| Err(TensorSnapshotError::IoError("broken storage".into()))),
-                    DType::F32, vec![2, 2], vec!["weight".into()], vec![], Default::default())
+                TensorSnapshot::from_closure(
+                    Rc::new(|| Err(TensorSnapshotError::IoError("broken storage".into()))),
+                    DType::F32,
+                    vec![2, 2],
+                    vec!["weight".into()],
+                    vec![],
+                    Default::default(),
+                )
             };
-            assert!(prepare_and_apply(&mut model, Path::new("synthetic"),
-                [("weight".into(), source)].into(), None, None, Dtype::F32).is_err());
+            assert!(
+                prepare_and_apply(
+                    &mut model,
+                    Path::new("synthetic"),
+                    [("weight".into(), source)].into(),
+                    None,
+                    None,
+                    Dtype::F32
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn rejects_data_that_disagrees_with_lazy_metadata() {
-        let source = TensorSnapshot::from_closure(Rc::new(|| Ok(TensorData::new(vec![1f32, 2.], [2]))),
-            DType::BF16, vec![2], vec!["weight".into()], vec![], Default::default());
+        let source = TensorSnapshot::from_closure(
+            Rc::new(|| Ok(TensorData::new(vec![1f32, 2.], [2]))),
+            DType::BF16,
+            vec![2],
+            vec!["weight".into()],
+            vec![],
+            Default::default(),
+        );
         let out = prepare(vec![source], Dtype::F32);
         assert!(out["weight"].to_data().is_err());
+    }
+
+    #[test]
+    fn pytorch_snapshots_keep_storage_alive_after_reader_drop() {
+        let sources = {
+            let reader = burn_store::pytorch::PytorchReader::new(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-state-dict.pth")
+            ).unwrap();
+            reader.tensors().iter().map(|(name, snapshot)|
+                (strip_pth_top_level(name).to_string(), snapshot.clone())).collect()
+        };
+        let snapshots = prepare_snapshots(sources, None, None, Dtype::F16).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].full_path(), "linear.weight");
+        let data = snapshots[0].to_data().unwrap();
+        assert_eq!(data.shape, vec![2, 3]);
+        assert_eq!(decode_f32(Dtype::F16, data.as_bytes()).unwrap(), vec![1., 2., 3., 4., 5., 6.]);
     }
 
 }
