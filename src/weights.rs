@@ -1134,17 +1134,23 @@ mod tests {
     fn pytorch_snapshots_keep_storage_alive_after_reader_drop() {
         let sources = {
             let reader = burn_store::pytorch::PytorchReader::new(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-state-dict.pth")
-            ).unwrap();
-            reader.tensors().iter().map(|(name, snapshot)|
-                (strip_pth_top_level(name).to_string(), snapshot.clone())).collect()
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-state-dict.pth"),
+            )
+            .unwrap();
+            reader
+                .tensors()
+                .iter()
+                .map(|(name, snapshot)| (strip_pth_top_level(name).to_string(), snapshot.clone()))
+                .collect()
         };
         let snapshots = prepare_snapshots(sources, None, None, Dtype::F16).unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].full_path(), "linear.weight");
         let data = snapshots[0].to_data().unwrap();
         assert_eq!(data.shape, vec![2, 3]);
-        assert_eq!(decode_f32(Dtype::F16, data.as_bytes()).unwrap(), vec![1., 2., 3., 4., 5., 6.]);
+        assert_eq!(
+            decode_f32(Dtype::F16, data.as_bytes()).unwrap(),
+            vec![1., 2., 3., 4., 5., 6.]
+        );
     }
-
 }

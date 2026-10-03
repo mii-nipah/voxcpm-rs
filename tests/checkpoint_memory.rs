@@ -79,14 +79,28 @@ fn load_does_not_allocate_a_second_converted_checkpoint() {
     // Every file entry borrows the same small source buffer during streaming
     // serialization, so fixture generation doesn't set a whole-checkpoint peak.
     {
-        let bytes: Vec<_> = (0..DIM * DIM).flat_map(|_| bf16::from_f32(0.5).to_le_bytes()).collect();
-        let views: Vec<_> = (0..LAYERS).map(|i| {
-            (format!("layers.{i}.weight"), TensorView::new(Dtype::BF16, vec![DIM, DIM], &bytes).unwrap())
-        }).collect();
-        safetensors::serialize_to_file(views, &None, &checkpoint.0.join("model.safetensors")).unwrap();
+        let bytes: Vec<_> = (0..DIM * DIM)
+            .flat_map(|_| bf16::from_f32(0.5).to_le_bytes())
+            .collect();
+        let views: Vec<_> = (0..LAYERS)
+            .map(|i| {
+                (
+                    format!("layers.{i}.weight"),
+                    TensorView::new(Dtype::BF16, vec![DIM, DIM], &bytes).unwrap(),
+                )
+            })
+            .collect();
+        safetensors::serialize_to_file(views, &None, &checkpoint.0.join("model.safetensors"))
+            .unwrap();
     }
     let mut model = Model::<B> {
-        layers: (0..LAYERS).map(|_| LinearConfig::new(DIM, DIM).with_bias(false).init(&Default::default())).collect(),
+        layers: (0..LAYERS)
+            .map(|_| {
+                LinearConfig::new(DIM, DIM)
+                    .with_bias(false)
+                    .init(&Default::default())
+            })
+            .collect(),
     };
     let baseline = LIVE.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
@@ -97,7 +111,17 @@ fn load_does_not_allocate_a_second_converted_checkpoint() {
     eprintln!("peak additional heap: {extra_peak} bytes; loaded F32 weights: {WEIGHT_BYTES} bytes");
     // Leave room for one tensor's conversion/transpose and loader metadata,
     // but fail if a complete second F32 checkpoint is retained or serialized.
-    assert!(extra_peak < WEIGHT_BYTES * 3 / 2,
-        "loading used {extra_peak} additional heap bytes for {WEIGHT_BYTES} weight bytes");
-    assert_eq!(model.layers[0].weight.val().to_data().to_vec::<f32>().unwrap()[0], 0.5);
+    assert!(
+        extra_peak < WEIGHT_BYTES * 3 / 2,
+        "loading used {extra_peak} additional heap bytes for {WEIGHT_BYTES} weight bytes"
+    );
+    assert_eq!(
+        model.layers[0]
+            .weight
+            .val()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap()[0],
+        0.5
+    );
 }
