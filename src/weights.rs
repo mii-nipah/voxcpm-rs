@@ -16,11 +16,13 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use burn::prelude::*;
-use burn::tensor::TensorData;
+use burn::tensor::{Bytes, DType, TensorData};
 use burn_store::{
-    ApplyResult, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore, SafetensorsStoreError,
+    ApplyResult, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter, SafetensorsStore,
+    SafetensorsStoreError, TensorSnapshot, TensorSnapshotError,
 };
 use half::{bf16, f16};
 use memmap2::Mmap;
@@ -123,7 +125,9 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     // the final report shows only params that were truly never loaded.
     let applied_set: std::collections::HashSet<&str> =
         result.applied.iter().map(|s| s.as_str()).collect();
-    result.missing.retain(|(path, _)| !applied_set.contains(path.as_str()));
+    result
+        .missing
+        .retain(|(path, _)| !applied_set.contains(path.as_str()));
     // While we're at it, dedupe the missing list itself (a param may be
     // reported missing by every file).
     let mut seen = std::collections::HashSet::new();
@@ -275,41 +279,21 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
 ) -> Result<ApplyResult> {
-    use std::time::Instant;
-    // Read, materialize weight_norm, re-serialize, then hand to burn-store.
-    let t0 = Instant::now();
-    let file = std::fs::File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let st = SafeTensors::deserialize(&mmap)?;
-    let tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = st
-        .names()
+    // The store's snapshots own an Arc to the mmap. Cloning the snapshots
+    // copies metadata only; source bytes are read when the module asks for
+    // each parameter, and the mmap stays alive until application finishes.
+    let mut store = SafetensorsStore::from_file(path);
+    let tensors = store
+        .get_all_snapshots()
+        .map_err(map_store_err)?
         .iter()
-        .map(|name| {
-            let view = st
-                .tensor(name)
-                .map_err(|_| Error::MissingWeight(name.to_string()))?;
-            Ok((
-                name.to_string(),
-                view.shape().to_vec(),
-                view.dtype(),
-                view.data().to_vec(),
-            ))
-        })
-        .collect::<Result<_>>()?;
-    log::debug!("weights[{}] mmap+parse: {:.2?}", path.display(), t0.elapsed());
-    drop(st);
-    drop(mmap);
-    repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
+        .map(|(name, snapshot)| (name.clone(), snapshot.clone()))
+        .collect();
+    prepare_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
 }
 
-/// Load a PyTorch pickle checkpoint (`.pt` / `.pth`) via [`burn_store`]'s
-/// [`PytorchReader`], then funnel the tensors through the same
-/// `materialize_weight_norm` + burn-store apply path used for safetensors.
-///
-/// Lets the crate consume HuggingFace distributions as-shipped when the
-/// repo publishes only `.pth` files (e.g. `audiovae.pth` in
-/// [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)), so no manual
-/// pth→safetensors conversion step is required on the user's side.
+/// Load PyTorch metadata lazily, preserving the reader's backing storage in
+/// the snapshots instead of materializing the entire checkpoint in RAM.
 fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     path: &Path,
@@ -318,33 +302,19 @@ fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
     target_float_dtype: Dtype,
 ) -> Result<ApplyResult> {
     use burn_store::pytorch::PytorchReader;
-    use std::time::Instant;
 
-    let t0 = Instant::now();
     let reader = PytorchReader::new(path)
         .map_err(|e| Error::Other(format!("read pytorch file `{}`: {e}", path.display())))?;
-    let mut tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::with_capacity(reader.len());
-    for (name, snapshot) in reader.tensors() {
-        let td = snapshot
-            .to_data()
-            .map_err(|e| Error::Other(format!("materialize `{name}` from pth: {e:?}")))?;
-        let dtype = burn_dtype_to_safetensors(td.dtype)?;
-        // Many HF-published `.pth` files wrap the weights under a top-level
-        // dict (e.g. `state_dict`, `model`, `model_state_dict`). Strip the
-        // common ones so downstream remapping sees bare parameter paths.
-        let bare = strip_pth_top_level(name);
-        tensors.push((bare.to_string(), td.shape.clone(), dtype, td.as_bytes().to_vec()));
-    }
-    log::debug!(
-        "weights[{}] read-pth: {:.2?} ({} tensors)",
-        path.display(),
-        t0.elapsed(),
-        tensors.len()
-    );
-    repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
+    let tensors = reader
+        .tensors()
+        .iter()
+        .map(|(name, snapshot)| (strip_pth_top_level(name).to_string(), snapshot.clone()))
+        .collect();
+    prepare_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
 }
 
-fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {    use burn::tensor::DType as B;
+fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {
+    use burn::tensor::DType as B;
     Ok(match dt {
         B::F64 => Dtype::F64,
         B::F32 | B::Flex32 => Dtype::F32,
@@ -367,31 +337,28 @@ fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {    use 
     })
 }
 
-fn repack_and_apply<B: Backend, M: ModuleSnapshot<B>>(
+fn prepare_and_apply<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     path: &Path,
-    tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)>,
+    tensors: HashMap<String, TensorSnapshot>,
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
 ) -> Result<ApplyResult> {
-    use std::time::Instant;
-    let t1 = Instant::now();
-    let synth_bytes = materialize_weight_norm(tensors, prefix, remap, target_float_dtype)?;
+    let t0 = std::time::Instant::now();
+    let snapshots = prepare_snapshots(tensors, prefix, remap, target_float_dtype)?;
+    let result = model.apply(snapshots, None, Some(Box::new(PyTorchToBurnAdapter)), false);
     log::debug!(
-        "weights[{}] materialize+repack: {:.2?} ({} MB)",
+        "weights[{}] lazy load+apply: {:.2?}",
         path.display(),
-        t1.elapsed(),
-        synth_bytes.len() / (1024 * 1024)
+        t0.elapsed()
     );
-
-    let t2 = Instant::now();
-    let mut store = SafetensorsStore::from_bytes(Some(synth_bytes))
-        .with_from_adapter(PyTorchToBurnAdapter)
-        .allow_partial(true);
-    let r = model.load_from(&mut store).map_err(map_store_err);
-    log::debug!("weights[{}] burn-store apply: {:.2?}", path.display(), t2.elapsed());
-    r
+    if !result.errors.is_empty() {
+        return Err(map_store_err(SafetensorsStoreError::ValidationFailed(
+            format!("Import errors: {:?}", result.errors),
+        )));
+    }
+    Ok(result)
 }
 
 fn map_store_err(e: SafetensorsStoreError) -> Error {
@@ -411,127 +378,175 @@ fn strip_pth_top_level(name: &str) -> &str {
     name
 }
 
-/// Read a safetensors file, expanding `weight_norm` parameter pairs
-/// (`X.weight_g` + `X.weight_v`) into their materialized `X.weight`. All
-/// other tensors are passed through unchanged. If `prefix` is provided, it
-/// is prepended to every key in the output. Returns a fresh serialized
-/// safetensors buffer.
-fn materialize_weight_norm(
-    tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)>,
+/// Build a lazy transformation graph. This retains only checkpoint metadata:
+/// dtype conversion, weight normalization and projection fusion happen for
+/// one destination parameter at a time. Never serialize a whole converted
+/// checkpoint: for the f32 backend that used to create a second multi-GB copy.
+fn prepare_snapshots(
+    mut tensors: HashMap<String, TensorSnapshot>,
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
-) -> Result<Vec<u8>> {
-    use safetensors::serialize;
-
-    let mut weight_g: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
-    let mut weight_v: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
-    let mut plain: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::new();
-
-    for (name, shape, dtype, data) in tensors {
-        if let Some(stem) = name.strip_suffix(".weight_g") {
-            weight_g.insert(stem.to_string(), (shape, decode_f32(dtype, &data)?));
-        } else if let Some(stem) = name.strip_suffix(".weight_v") {
-            weight_v.insert(stem.to_string(), (shape, decode_f32(dtype, &data)?));
-        } else {
-            plain.push((name, shape, dtype, data));
-        }
-    }
-
-    // Translate `name` (bare HF key, no prefix) through the optional remap and
-    // then add the prefix. Returns `None` if the remap drops the key.
-    let translate = |name: &str| -> Option<String> {
-        let mapped: String = match remap {
-            Some(f) => f(name)?,
-            None => name.to_string(),
-        };
-        Some(match prefix {
-            Some(p) => format!("{p}{mapped}"),
-            None => mapped,
-        })
+) -> Result<Vec<TensorSnapshot>> {
+    let target_dtype = match target_float_dtype {
+        Dtype::F32 => DType::F32,
+        Dtype::F16 => DType::F16,
+        Dtype::BF16 => DType::BF16,
+        other => return Err(Error::Unsupported(format!("target float dtype {other:?}"))),
     };
-
-    let mut out: HashMap<String, (Dtype, Vec<usize>, Vec<u8>)> = HashMap::new();
-    for (name, shape, dtype, data) in plain {
-        let Some(key) = translate(&name) else { continue };
-        // Convert source float dtype directly to target float dtype. burn-store
-        // does NOT auto-cast across dtypes (source bytes are handed straight to
-        // the target tensor), so we must match the backend dtype here. Direct
-        // single-pass conversion writes straight into the output Vec<u8>,
-        // skipping the intermediate Vec<f32> that decode_f32+encode_float
-        // would allocate (matters a lot for multi-GB models).
-        let (dtype, data) = match dtype {
-            Dtype::F32 | Dtype::F16 | Dtype::BF16 if dtype == target_float_dtype => {
-                (dtype, data) // already correct dtype, pass through
-            }
-            Dtype::F32 | Dtype::F16 | Dtype::BF16 => {
-                (target_float_dtype, convert_float_bytes(dtype, target_float_dtype, &data))
-            }
-            other => (other, data),
+    // Check actual lazy reads against metadata, including PyTorch's backing
+    // storage. A malformed source must not be reinterpreted as another dtype.
+    tensors = tensors
+        .into_iter()
+        .map(|(name, snapshot)| {
+            let source = snapshot.clone_data_fn();
+            let dtype = snapshot.dtype;
+            let shape = snapshot.shape.clone();
+            let expected_len = snapshot.data_len();
+            let path = name.clone();
+            let checked = TensorSnapshot::from_closure(
+                Rc::new(move || {
+                    let data = source()?;
+                    if data.dtype != dtype
+                        || data.shape != shape
+                        || data.as_bytes().len() != expected_len
+                    {
+                        return Err(TensorSnapshotError::DataError(format!(
+                            "tensor data disagrees with metadata for {path}"
+                        )));
+                    }
+                    Ok(data)
+                }),
+                dtype,
+                snapshot.shape,
+                snapshot.path_stack.unwrap_or_default(),
+                vec![],
+                Default::default(),
+            );
+            (name, checked)
+        })
+        .collect();
+    let v_keys: Vec<_> = tensors
+        .keys()
+        .filter(|k| k.ends_with(".weight_v"))
+        .cloned()
+        .collect();
+    for v_key in v_keys {
+        let stem = v_key.strip_suffix(".weight_v").unwrap();
+        let v = tensors.remove(&v_key).unwrap();
+        let g_key = format!("{stem}.weight_g");
+        let g = tensors
+            .remove(&g_key)
+            .ok_or_else(|| Error::MissingWeight(g_key.clone()))?;
+        let Some(&c_out) = v.shape.first() else {
+            return Err(Error::Other(format!(
+                "weight_norm expects a non-scalar tensor at {stem}"
+            )));
         };
-        out.insert(key, (dtype, shape, data));
-    }
-
-    for (stem, (v_shape, v_data)) in weight_v {
-        let (g_shape, g_data) = weight_g
-            .remove(&stem)
-            .ok_or_else(|| Error::MissingWeight(format!("{stem}.weight_g")))?;
-        let c_out = v_shape[0];
-        let inner: usize = v_shape.iter().skip(1).product();
-        if g_data.len() != c_out {
+        if g.shape.iter().product::<usize>() != c_out {
             return Err(Error::ShapeMismatch {
-                name: format!("{stem}.weight_g"),
+                name: g_key,
                 expected: vec![c_out],
-                actual: g_shape,
+                actual: g.shape,
             });
         }
-        let mut w = vec![0f32; v_data.len()];
-        for i in 0..c_out {
-            let off = i * inner;
-            let slice = &v_data[off..off + inner];
-            let norm_sq: f32 = slice.iter().map(|x| x * x).sum();
-            let norm = norm_sq.sqrt().max(1e-12);
-            let scale = g_data[i] / norm;
-            for j in 0..inner {
-                w[off + j] = slice[j] * scale;
+        let v_dtype = burn_dtype_to_safetensors(v.dtype)?;
+        let g_dtype = burn_dtype_to_safetensors(g.dtype)?;
+        for dtype in [v_dtype, g_dtype] {
+            if !matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+                return Err(Error::Unsupported(format!(
+                    "safetensors dtype {dtype:?} for weight_norm tensor"
+                )));
             }
         }
-        let bytes = encode_float(target_float_dtype, &w);
-        let bare = format!("{stem}.weight");
-        let Some(key) = translate(&bare) else { continue };
-        out.insert(key, (target_float_dtype, v_shape, bytes));
+        let shape = v.shape.clone();
+        let inner: usize = shape.iter().skip(1).product();
+        let data_shape = shape.clone();
+        let data_fn = Rc::new(move || {
+            let v_data = decode_f32(v_dtype, v.to_data()?.as_bytes()).map_err(snapshot_error)?;
+            let g_data = decode_f32(g_dtype, g.to_data()?.as_bytes()).map_err(snapshot_error)?;
+            let mut w = vec![0f32; v_data.len()];
+            for (i, g) in g_data.iter().enumerate() {
+                let off = i * inner;
+                let slice = &v_data[off..off + inner];
+                let norm_sq: f32 = slice.iter().map(|x| x * x).sum();
+                let scale = g / norm_sq.sqrt().max(1e-12);
+                for j in 0..inner {
+                    w[off + j] = slice[j] * scale;
+                }
+            }
+            Ok(tensor_data(
+                encode_float(target_float_dtype, &w),
+                data_shape.clone(),
+                target_dtype,
+            ))
+        });
+        let key = format!("{stem}.weight");
+        tensors.insert(
+            key.clone(),
+            TensorSnapshot::from_closure(
+                data_fn,
+                target_dtype,
+                shape,
+                key.split('.').map(str::to_owned).collect(),
+                vec![],
+                Default::default(),
+            ),
+        );
+    }
+    if let Some(key) = tensors.keys().find(|k| k.ends_with(".weight_g")) {
+        return Err(Error::Other(format!("weight_g without weight_v: {key}")));
     }
 
-    if !weight_g.is_empty() {
-        let leftover: Vec<String> = weight_g.keys().cloned().collect();
-        return Err(Error::Other(format!(
-            "weight_g without weight_v: {leftover:?}"
-        )));
+    let mut out = HashMap::new();
+    for (name, mut snapshot) in tensors {
+        let mapped = match remap {
+            Some(f) => match f(&name) {
+                Some(mapped) => mapped,
+                None => continue,
+            },
+            None => name,
+        };
+        let key = format!("{}{mapped}", prefix.unwrap_or_default());
+        snapshot.path_stack = Some(key.split('.').map(str::to_owned).collect());
+        let dtype = burn_dtype_to_safetensors(snapshot.dtype)?;
+        if matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) && dtype != target_float_dtype {
+            let source = snapshot.clone_data_fn();
+            let shape = snapshot.shape.clone();
+            let data_fn = Rc::new(move || {
+                let data = source()?;
+                Ok(tensor_data(
+                    convert_float_bytes(dtype, target_float_dtype, data.as_bytes()),
+                    shape.clone(),
+                    target_dtype,
+                ))
+            });
+            snapshot = TensorSnapshot::from_closure(
+                data_fn,
+                target_dtype,
+                snapshot.shape,
+                snapshot.path_stack.unwrap(),
+                vec![],
+                Default::default(),
+            );
+        }
+        out.insert(key, snapshot);
     }
+    fuse_projections(&mut out, &["q_proj", "k_proj", "v_proj"], "qkv_proj", false)?;
+    fuse_projections(&mut out, &["gate_proj", "up_proj"], "gate_up_proj", true)?;
+    Ok(out.into_values().collect())
+}
 
-    // Fuse Q/K/V projections. The Rust attention module uses a single
-    // `qkv_proj.weight` linear (fused along the output dim) to save kernel
-    // launches on GPU. Checkpoints store three separate tensors; stitch
-    // them here post-remap/post-weight-norm so all sources (plain Python
-    // safetensors, weight-norm materialized, etc.) land in the same map.
-    //
-    // `nn::Linear` weights in burn are `[out_features, in_features]`, so we
-    // concat along dim 0 (row concat) in the order (q, k, v) to match the
-    // `q_size + 2*kv_size` layout the attention forward expects.
-    fuse_qkv(&mut out)?;
-    fuse_gate_up(&mut out)?;
+fn snapshot_error(error: Error) -> TensorSnapshotError {
+    TensorSnapshotError::DataError(error.to_string())
+}
 
-    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = out
-        .iter()
-        .map(|(k, (dtype, shape, data))| {
-            let tv = safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
-                .map_err(|e| Error::Other(format!("compose safetensors view `{k}`: {e}")))?;
-            Ok::<_, Error>((k.clone(), tv))
-        })
-        .collect::<std::result::Result<_, _>>()?;
-    let bytes = serialize(views.iter().map(|(k, v)| (k.clone(), v)), &None)
-        .map_err(|e| Error::Other(format!("serialize synthesized safetensors: {e}")))?;
-    Ok(bytes)
+fn tensor_data(bytes: Vec<u8>, shape: Vec<usize>, dtype: DType) -> TensorData {
+    TensorData {
+        bytes: Bytes::from_bytes_vec(bytes),
+        shape,
+        dtype,
+    }
 }
 
 fn decode_f32(dtype: Dtype, data: &[u8]) -> Result<Vec<f32>> {
@@ -634,140 +649,71 @@ fn encode_float(dtype: Dtype, v: &[f32]) -> Vec<u8> {
     }
 }
 
-/// Fuse `q_proj`/`k_proj`/`v_proj` weights into a single `qkv_proj.weight`
-/// entry. The attention module stores these as one `Linear` to save kernel
-/// launches at inference; the reference checkpoint stores them separately.
-///
-/// PyTorch `Linear.weight` is `[out_features, in_features]`, so concatenating
-/// along dim 0 (the out-features axis) in row-major storage is just byte
-/// append in (q, k, v) order — matching the `q_size + 2*kv_size` split the
-/// attention forward expects.
-///
-/// The `PyTorchToBurnAdapter` downstream still does its usual `[out,in] ->
-/// [in,out]` transpose, landing the fused tensor correctly in burn's layout.
-fn fuse_qkv(
-    out: &mut HashMap<String, (Dtype, Vec<usize>, Vec<u8>)>,
+/// Fuse output rows in checkpoint order, before PyTorchToBurnAdapter performs
+/// the Linear [out, in] -> [in, out] transpose. Each source is materialized
+/// and released separately; only the fused output survives this closure.
+fn fuse_projections(
+    tensors: &mut HashMap<String, TensorSnapshot>,
+    projections: &[&str],
+    fused_name: &str,
+    equal_rows: bool,
 ) -> Result<()> {
-    // Collect all `...q_proj.weight` keys first so we can mutate `out` inside
-    // the loop without aliasing.
-    let q_keys: Vec<String> = out
+    let suffix = format!(".{}.weight", projections[0]);
+    let first_keys: Vec<_> = tensors
         .keys()
-        .filter(|k| k.ends_with(".q_proj.weight"))
+        .filter(|k| k.ends_with(&suffix))
         .cloned()
         .collect();
-
-    for q_key in q_keys {
-        let stem = q_key
-            .strip_suffix(".q_proj.weight")
-            .expect("filter guarantees suffix");
-        let k_key = format!("{stem}.k_proj.weight");
-        let v_key = format!("{stem}.v_proj.weight");
-        let qkv_key = format!("{stem}.qkv_proj.weight");
-
-        // Only fuse if all three siblings exist; otherwise this is a linear
-        // that happens to be called `q_proj` in some unrelated module.
-        if !out.contains_key(&k_key) || !out.contains_key(&v_key) {
+    for first_key in first_keys {
+        let stem = first_key.strip_suffix(&suffix).unwrap();
+        let keys: Vec<_> = projections
+            .iter()
+            .map(|p| format!("{stem}.{p}.weight"))
+            .collect();
+        // Preserve unrelated/incomplete projection groups as individual tensors.
+        if !keys.iter().all(|key| tensors.contains_key(key)) {
             continue;
         }
-
-        let (q_dt, q_shape, q_data) = out.remove(&q_key).unwrap();
-        let (k_dt, k_shape, k_data) = out.remove(&k_key).unwrap();
-        let (v_dt, v_shape, v_data) = out.remove(&v_key).unwrap();
-
-        if q_dt != k_dt || q_dt != v_dt {
+        let sources: Vec<_> = keys
+            .iter()
+            .map(|key| tensors.remove(key).unwrap())
+            .collect();
+        let first = &sources[0];
+        if sources
+            .iter()
+            .any(|s| s.dtype != first.dtype || s.shape.len() != 2)
+            || sources.iter().any(|s| {
+                s.shape[1] != first.shape[1] || (equal_rows && s.shape[0] != first.shape[0])
+            })
+        {
             return Err(Error::Other(format!(
-                "qkv fusion dtype mismatch at {stem}: q={q_dt:?} k={k_dt:?} v={v_dt:?}"
+                "{fused_name} fusion dtype/shape mismatch at {stem}"
             )));
         }
-        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2 {
-            return Err(Error::Other(format!(
-                "qkv fusion expects 2D weights at {stem}, got {q_shape:?}/{k_shape:?}/{v_shape:?}"
-            )));
-        }
-        // In-features (dim 1) must match across q/k/v.
-        if q_shape[1] != k_shape[1] || q_shape[1] != v_shape[1] {
-            return Err(Error::Other(format!(
-                "qkv fusion in-features mismatch at {stem}: q={} k={} v={}",
-                q_shape[1], k_shape[1], v_shape[1]
-            )));
-        }
-
-        let fused_shape = vec![q_shape[0] + k_shape[0] + v_shape[0], q_shape[1]];
-        let mut fused = Vec::with_capacity(q_data.len() + k_data.len() + v_data.len());
-        fused.extend_from_slice(&q_data);
-        fused.extend_from_slice(&k_data);
-        fused.extend_from_slice(&v_data);
-
-        out.insert(qkv_key, (q_dt, fused_shape, fused));
+        let dtype = first.dtype;
+        let shape = vec![sources.iter().map(|s| s.shape[0]).sum(), first.shape[1]];
+        let data_shape = shape.clone();
+        let byte_len = sources.iter().map(TensorSnapshot::data_len).sum();
+        let data_fn = Rc::new(move || {
+            let mut bytes = Vec::with_capacity(byte_len);
+            for source in &sources {
+                bytes.extend_from_slice(source.to_data()?.as_bytes());
+            }
+            Ok(tensor_data(bytes, data_shape.clone(), dtype))
+        });
+        let key = format!("{stem}.{fused_name}.weight");
+        tensors.insert(
+            key.clone(),
+            TensorSnapshot::from_closure(
+                data_fn,
+                dtype,
+                shape,
+                key.split('.').map(str::to_owned).collect(),
+                vec![],
+                Default::default(),
+            ),
+        );
     }
-
-    Ok(())
-}
-
-/// Fuse `gate_proj` + `up_proj` into a single `gate_up_proj` weight.
-///
-/// Gated MLPs compute `down(silu(gate(x)) * up(x))`. `gate` and `up` share
-/// the same input and output shape (`[hidden, intermediate]` with no bias),
-/// so they can be packed into one matmul that produces a `2*intermediate`
-/// output, then split along the last dim.
-///
-/// Same byte-concat trick as `fuse_qkv`: in PyTorch row-major `[out, in]`
-/// layout, dim-0 concat is just byte append. The `PyTorchToBurnAdapter`
-/// transposes downstream into burn's `[in, out]` layout.
-fn fuse_gate_up(
-    out: &mut HashMap<String, (Dtype, Vec<usize>, Vec<u8>)>,
-) -> Result<()> {
-    let gate_keys: Vec<String> = out
-        .keys()
-        .filter(|k| k.ends_with(".gate_proj.weight"))
-        .cloned()
-        .collect();
-
-    for gate_key in gate_keys {
-        let stem = gate_key
-            .strip_suffix(".gate_proj.weight")
-            .expect("filter guarantees suffix");
-        let up_key = format!("{stem}.up_proj.weight");
-        let fused_key = format!("{stem}.gate_up_proj.weight");
-
-        if !out.contains_key(&up_key) {
-            continue;
-        }
-
-        let (g_dt, g_shape, g_data) = out.remove(&gate_key).unwrap();
-        let (u_dt, u_shape, u_data) = out.remove(&up_key).unwrap();
-
-        if g_dt != u_dt {
-            return Err(Error::Other(format!(
-                "gate/up fusion dtype mismatch at {stem}: gate={g_dt:?} up={u_dt:?}"
-            )));
-        }
-        if g_shape.len() != 2 || u_shape.len() != 2 {
-            return Err(Error::Other(format!(
-                "gate/up fusion expects 2D weights at {stem}, got {g_shape:?}/{u_shape:?}"
-            )));
-        }
-        if g_shape[1] != u_shape[1] {
-            return Err(Error::Other(format!(
-                "gate/up fusion in-features mismatch at {stem}: gate={} up={}",
-                g_shape[1], u_shape[1]
-            )));
-        }
-        if g_shape[0] != u_shape[0] {
-            return Err(Error::Other(format!(
-                "gate/up fusion out-features mismatch at {stem}: gate={} up={}",
-                g_shape[0], u_shape[0]
-            )));
-        }
-
-        let fused_shape = vec![g_shape[0] + u_shape[0], g_shape[1]];
-        let mut fused = Vec::with_capacity(g_data.len() + u_data.len());
-        fused.extend_from_slice(&g_data);
-        fused.extend_from_slice(&u_data);
-
-        out.insert(fused_key, (g_dt, fused_shape, fused));
-    }
-
     Ok(())
 }
 
@@ -837,5 +783,374 @@ impl Drop for SafetensorsFile {
         unsafe {
             let _ = Box::from_raw(self.view as *mut SafeTensors<'static>);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn snapshot(name: &str, shape: &[usize], values: &[f32], dtype: DType) -> TensorSnapshot {
+        TensorSnapshot::from_data(
+            TensorData::new(values.to_vec(), shape.to_vec()).convert_dtype(dtype),
+            name.split('.').map(str::to_owned).collect(),
+            vec![],
+            Default::default(),
+        )
+    }
+
+    fn prepare(sources: Vec<TensorSnapshot>, dtype: Dtype) -> HashMap<String, TensorSnapshot> {
+        prepare_snapshots(
+            sources.into_iter().map(|s| (s.full_path(), s)).collect(),
+            None,
+            None,
+            dtype,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.full_path(), s))
+        .collect()
+    }
+
+    #[test]
+    fn conversions_are_lazy_and_preserve_float_values() {
+        for source_dtype in [DType::F32, DType::F16, DType::BF16] {
+            for target_dtype in [Dtype::F32, Dtype::F16, Dtype::BF16] {
+                let calls = Rc::new(Cell::new(0));
+                let counter = calls.clone();
+                let source = snapshot("weight", &[4], &[0., -2., 0.5, 16.], source_dtype);
+                let s = TensorSnapshot::from_closure(
+                    Rc::new(move || {
+                        counter.set(counter.get() + 1);
+                        source.to_data()
+                    }),
+                    source_dtype,
+                    vec![4],
+                    vec!["weight".into()],
+                    vec![],
+                    Default::default(),
+                );
+                let out = prepare(vec![s], target_dtype);
+                assert_eq!(calls.get(), 0, "preparation must never read tensor bytes");
+                let data = out["weight"].to_data().unwrap();
+                assert_eq!(burn_dtype_to_safetensors(data.dtype).unwrap(), target_dtype);
+                assert_eq!(
+                    decode_f32(target_dtype, data.as_bytes()).unwrap(),
+                    vec![0., -2., 0.5, 16.]
+                );
+                assert_eq!(calls.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn fuses_qkv_and_gate_up_in_checkpoint_row_order() {
+        let out = prepare(
+            vec![
+                snapshot("attn.v_proj.weight", &[1, 2], &[7., 8.], DType::BF16),
+                snapshot("mlp.up_proj.weight", &[1, 2], &[11., 12.], DType::F16),
+                snapshot(
+                    "attn.q_proj.weight",
+                    &[2, 2],
+                    &[1., 2., 3., 4.],
+                    DType::BF16,
+                ),
+                snapshot("attn.k_proj.weight", &[1, 2], &[5., 6.], DType::BF16),
+                snapshot("mlp.gate_proj.weight", &[1, 2], &[9., 10.], DType::F16),
+            ],
+            Dtype::F32,
+        );
+        assert_eq!(out.len(), 2);
+        let qkv = out["attn.qkv_proj.weight"].to_data().unwrap();
+        assert_eq!(qkv.shape, vec![4, 2]);
+        assert_eq!(
+            qkv.to_vec::<f32>().unwrap(),
+            vec![1., 2., 3., 4., 5., 6., 7., 8.]
+        );
+        assert_eq!(
+            out["mlp.gate_up_proj.weight"]
+                .to_data()
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap(),
+            vec![9., 10., 11., 12.]
+        );
+    }
+
+    #[test]
+    fn materializes_weight_norm_and_remaps_audio_vae() {
+        let sources = [
+            snapshot(
+                "decoder.model.0.weight_v",
+                &[2, 1, 2],
+                &[3., 4., 0., 0.],
+                DType::F32,
+            ),
+            snapshot(
+                "decoder.model.0.weight_g",
+                &[2, 1, 1],
+                &[10., 2.],
+                DType::F32,
+            ),
+            snapshot("decoder.sr_bin_boundaries", &[1], &[42.], DType::F32),
+        ];
+        let out = prepare_snapshots(
+            sources.into_iter().map(|s| (s.full_path(), s)).collect(),
+            Some("audio_vae."),
+            Some(remap_audiovae_key),
+            Dtype::BF16,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].full_path(), "audio_vae.decoder.first.dw.conv.weight");
+        let data = out[0].to_data().unwrap();
+        assert_eq!(data.shape, vec![2, 1, 2]);
+        assert_eq!(
+            decode_f32(Dtype::BF16, data.as_bytes()).unwrap(),
+            vec![6., 8., 0., 0.]
+        );
+    }
+
+    #[test]
+    fn rejects_orphan_norm_weights_and_incompatible_fusion() {
+        for name in ["conv.weight_v", "conv.weight_g"] {
+            let s = snapshot(name, &[1], &[1.], DType::F32);
+            assert!(
+                prepare_snapshots([(name.to_string(), s)].into(), None, None, Dtype::F32).is_err()
+            );
+        }
+        for (shape, values) in [(vec![], vec![1.]), (vec![2, 1], vec![1., 2.])] {
+            let sources = [
+                snapshot("mlp.gate_proj.weight", &[1, 1], &[1.], DType::F32),
+                snapshot("mlp.up_proj.weight", &shape, &values, DType::F32),
+            ];
+            assert!(
+                prepare_snapshots(
+                    sources.into_iter().map(|s| (s.full_path(), s)).collect(),
+                    None,
+                    None,
+                    Dtype::F32
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_projection_groups_and_integer_buffers_are_preserved() {
+        let int = TensorSnapshot::from_data(
+            TensorData::new(vec![1i64, 2], [2]),
+            vec!["positions".into()],
+            vec![],
+            Default::default(),
+        );
+        let out = prepare(
+            vec![
+                int,
+                snapshot("attn.q_proj.weight", &[1, 2], &[1., 2.], DType::F32),
+            ],
+            Dtype::F16,
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out.contains_key("attn.q_proj.weight"));
+        assert_eq!(
+            out["positions"].to_data().unwrap().to_vec::<i64>().unwrap(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn strips_pytorch_container_prefixes() {
+        for prefix in ["state_dict.", "model_state_dict.", "module.", ""] {
+            assert_eq!(
+                strip_pth_top_level(&format!("{prefix}layer.weight")),
+                "layer.weight"
+            );
+        }
+    }
+
+    struct TempCheckpoint(std::path::PathBuf);
+    impl TempCheckpoint {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "voxcpm-weights-{}-{}.safetensors",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            Self(path)
+        }
+    }
+    impl Drop for TempCheckpoint {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn file_snapshots_keep_their_mmap_alive_after_store_drop() {
+        let file = TempCheckpoint::new();
+        let bytes = encode_float(Dtype::BF16, &[1., 2., 3., 4.]);
+        let view = safetensors::tensor::TensorView::new(Dtype::BF16, vec![2, 2], &bytes).unwrap();
+        safetensors::serialize_to_file([("weight", view)], &None, &file.0).unwrap();
+        let sources = {
+            let mut store = SafetensorsStore::from_file(&file.0);
+            store
+                .get_all_snapshots()
+                .unwrap()
+                .iter()
+                .map(|(k, s)| (k.clone(), s.clone()))
+                .collect()
+        };
+        let snapshots = prepare_snapshots(sources, None, None, Dtype::F32).unwrap();
+        assert_eq!(
+            snapshots[0].to_data().unwrap().to_vec::<f32>().unwrap(),
+            vec![1., 2., 3., 4.]
+        );
+    }
+
+    #[cfg(feature = "cpu")]
+    #[derive(Module, Debug)]
+    struct ProjectionModule<B: Backend> {
+        attn: AttentionModule<B>,
+        untouched: burn::nn::Linear<B>,
+    }
+    #[cfg(feature = "cpu")]
+    #[derive(Module, Debug)]
+    struct AttentionModule<B: Backend> {
+        qkv_proj: burn::nn::Linear<B>,
+    }
+
+    #[test]
+    #[cfg(feature = "cpu")]
+    fn applies_fused_linear_with_transpose_without_reading_unused_tensors() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let mut model = ProjectionModule::<B> {
+            attn: AttentionModule {
+                qkv_proj: burn::nn::LinearConfig::new(2, 4)
+                    .with_bias(false)
+                    .init(&device),
+            },
+            untouched: burn::nn::LinearConfig::new(2, 2)
+                .with_bias(false)
+                .init(&device),
+        };
+        let unread = TensorSnapshot::from_closure(
+            Rc::new(|| panic!("unused tensor must remain lazy")),
+            DType::F32,
+            vec![1],
+            vec!["unused".into()],
+            vec![],
+            Default::default(),
+        );
+        let sources = [
+            snapshot(
+                "attn.q_proj.weight",
+                &[2, 2],
+                &[1., 2., 3., 4.],
+                DType::BF16,
+            ),
+            snapshot("attn.k_proj.weight", &[1, 2], &[5., 6.], DType::BF16),
+            snapshot("attn.v_proj.weight", &[1, 2], &[7., 8.], DType::BF16),
+            unread,
+        ];
+        let result = prepare_and_apply(
+            &mut model,
+            Path::new("synthetic"),
+            sources.into_iter().map(|s| (s.full_path(), s)).collect(),
+            None,
+            None,
+            Dtype::F32,
+        )
+        .unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.applied, vec!["attn.qkv_proj.weight"]);
+        assert!(
+            result
+                .missing
+                .iter()
+                .any(|(key, _)| key == "untouched.weight")
+        );
+        assert_eq!(result.unused, vec!["unused"]);
+        let data = model.attn.qkv_proj.weight.val().to_data();
+        assert_eq!(data.shape, vec![2, 4]);
+        assert_eq!(
+            data.to_vec::<f32>().unwrap(),
+            vec![1., 3., 5., 7., 2., 4., 6., 8.]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cpu")]
+    fn apply_rejects_shape_mismatches_and_deferred_read_errors() {
+        type B = burn::backend::NdArray<f32>;
+        for malformed_shape in [true, false] {
+            let mut model = burn::nn::LinearConfig::new(2, 2)
+                .with_bias(false)
+                .init::<B>(&Default::default());
+            let source = if malformed_shape {
+                snapshot("weight", &[1, 2], &[1., 2.], DType::F32)
+            } else {
+                TensorSnapshot::from_closure(
+                    Rc::new(|| Err(TensorSnapshotError::IoError("broken storage".into()))),
+                    DType::F32,
+                    vec![2, 2],
+                    vec!["weight".into()],
+                    vec![],
+                    Default::default(),
+                )
+            };
+            assert!(
+                prepare_and_apply(
+                    &mut model,
+                    Path::new("synthetic"),
+                    [("weight".into(), source)].into(),
+                    None,
+                    None,
+                    Dtype::F32
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_data_that_disagrees_with_lazy_metadata() {
+        let source = TensorSnapshot::from_closure(
+            Rc::new(|| Ok(TensorData::new(vec![1f32, 2.], [2]))),
+            DType::BF16,
+            vec![2],
+            vec!["weight".into()],
+            vec![],
+            Default::default(),
+        );
+        let out = prepare(vec![source], Dtype::F32);
+        assert!(out["weight"].to_data().is_err());
+    }
+
+    #[test]
+    fn pytorch_snapshots_keep_storage_alive_after_reader_drop() {
+        let sources = {
+            let reader = burn_store::pytorch::PytorchReader::new(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-state-dict.pth"),
+            )
+            .unwrap();
+            reader
+                .tensors()
+                .iter()
+                .map(|(name, snapshot)| (strip_pth_top_level(name).to_string(), snapshot.clone()))
+                .collect()
+        };
+        let snapshots = prepare_snapshots(sources, None, None, Dtype::F16).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].full_path(), "linear.weight");
+        let data = snapshots[0].to_data().unwrap();
+        assert_eq!(data.shape, vec![2, 3]);
+        assert_eq!(
+            decode_f32(Dtype::F16, data.as_bytes()).unwrap(),
+            vec![1., 2., 3., 4., 5., 6.]
+        );
     }
 }
