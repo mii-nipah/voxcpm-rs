@@ -69,6 +69,16 @@ memmap2 = "0.9"
 approx = "0.5"
 env_logger = "0.11"
 
+# These diagnostics have no CPU backend.
+[[example]]
+name = "bf16_matacc"
+required-features = ["vulkan"]
+
+[[example]]
+name = "bf16_probe"
+# Both `wgpu` and `vulkan` enable this dependency feature.
+required-features = ["burn/wgpu"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

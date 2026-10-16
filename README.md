@@ -132,6 +132,22 @@ Load-phase progress is reported via the [`log`](https://crates.io/crates/log)
 crate, so wiring up `env_logger` / `tracing-log` surfaces it.
 
 
+### Memory while loading
+
+Checkpoint tensors are loaded lazily. Float conversion, weight normalization,
+and projection fusion run as each parameter is applied, without keeping a
+second, fully converted checkpoint in RAM. SafeTensors data stays memory-mapped;
+PyTorch files retain their backing storage and read it on demand.
+
+This reduces temporary host allocations, but does not reduce the model's final
+RAM/VRAM footprint. For example, 4.3 GB of BF16 weights occupy about 8.6 GB after
+conversion to F32 on `wgpu`, before activations, KV caches, and backend buffers.
+A 12 GB GPU can therefore still run out of memory. The opt-in BF16 Vulkan backend
+below reduces weight storage when supported by your hardware. Memory-mapped file
+pages also count toward resident memory, and a PyTorch tensor may require reading
+its entire shared storage entry. No fixed RAM/VRAM limit is guaranteed.
+
+
 ## Backends & features
 
 Pick exactly one backend:

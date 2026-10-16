@@ -1,0 +1,59 @@
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: CPU tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cpu-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Check loader formatting
+        run: rustfmt --edition 2024 --check src/weights.rs tests/checkpoint_memory.rs
+      - name: CPU tests
+        run: |
+          cargo test --locked --no-default-features --features cpu
+          cargo test --locked --no-default-features --features cpu --test checkpoint_memory -- --nocapture
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+
+  wgpu:
+    name: WGPU compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: wgpu-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo check --locked --no-default-features --features wgpu --lib
